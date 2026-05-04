@@ -227,7 +227,7 @@ function createPanel() {
     const panel = document.createElement("div");
     panel.id = "aimdo-viz-panel";
     panel.style.cssText = `
-        position: fixed; bottom: 10px; right: 10px;
+        position: fixed;
         background: ${C.bg}; color: ${C.text};
         border: 1px solid ${C.border}; border-radius: 8px;
         padding: 0; font-family: monospace; font-size: 12px;
@@ -235,12 +235,45 @@ function createPanel() {
         box-shadow: 0 4px 12px rgba(0,0,0,0.7);
         user-select: none; resize: horizontal; overflow-y: auto;
     `;
-    if (saved.left != null && saved.top != null) {
-        panel.style.left = saved.left + "px";
-        panel.style.top = saved.top + "px";
+
+    // dock against .graph-canvas-panel's bottom-right corner (the splitter
+    // panel that shrinks when sidebars open). #graph-canvas-container stays
+    // full-viewport so it can't be used as bounds.
+    function getCanvasEl() {
+        return document.querySelector(".graph-canvas-panel")
+            || document.getElementById("graph-canvas-container")
+            || document.getElementById("graph-canvas")
+            || (app && app.canvasEl)
+            || null;
+    }
+
+    function getCanvasBounds() {
+        const el = getCanvasEl();
+        if (el) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return r;
+        }
+        return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+    }
+
+    let rightOffset = saved.rightOffset != null ? saved.rightOffset : 10;
+    let bottomOffset = saved.bottomOffset != null ? saved.bottomOffset : 10;
+
+    // visual-only — closure offsets are user intent, only mutated on drag,
+    // so a temporary clamp from a small parent doesn't overwrite saved state
+    function applyOffsets() {
+        const b = getCanvasBounds();
+        const w = panel.offsetWidth, h = panel.offsetHeight;
+        const maxRight = Math.max(0, b.right - b.left - w);
+        const maxBottom = Math.max(0, b.bottom - b.top - h);
+        const ro = Math.max(0, Math.min(rightOffset, maxRight));
+        const bo = Math.max(0, Math.min(bottomOffset, maxBottom));
+        panel.style.left = (b.right - w - ro) + "px";
+        panel.style.top = (b.bottom - h - bo) + "px";
         panel.style.right = "auto";
         panel.style.bottom = "auto";
     }
+    window.addEventListener("resize", applyOffsets);
 
     const header = document.createElement("div");
     header.style.cssText = `
@@ -344,17 +377,45 @@ function createPanel() {
     });
     document.addEventListener("mousemove", (e) => {
         if (!dragging) return;
-        panel.style.left = (e.clientX - dx) + "px";
-        panel.style.top = (e.clientY - dy) + "px";
-        panel.style.right = "auto";
-        panel.style.bottom = "auto";
+        const b = getCanvasBounds();
+        const w = panel.offsetWidth, h = panel.offsetHeight;
+        rightOffset = b.right - (e.clientX - dx) - w;
+        bottomOffset = b.bottom - (e.clientY - dy) - h;
+        applyOffsets();
     });
     document.addEventListener("mouseup", () => {
-        if (dragging) saveState({ left: panel.offsetLeft, top: panel.offsetTop });
+        if (dragging) {
+            // clamp before persist so an off-screen drop doesn't get saved
+            const b = getCanvasBounds();
+            const w = panel.offsetWidth, h = panel.offsetHeight;
+            rightOffset = Math.max(0, Math.min(rightOffset, b.right - b.left - w));
+            bottomOffset = Math.max(0, Math.min(bottomOffset, b.bottom - b.top - h));
+            applyOffsets();
+            saveState({ rightOffset, bottomOffset });
+        }
         dragging = false;
     });
 
     document.body.appendChild(panel);
+    applyOffsets();
+
+    // sidebar toggles don't fire window.resize, so observe the panel directly.
+    // canvas may not exist during setup(), so poll until it does.
+    let observed = null;
+    function attachCanvasObserver() {
+        const el = getCanvasEl();
+        if (!el) {
+            requestAnimationFrame(attachCanvasObserver);
+            return;
+        }
+        if (el === observed) return;
+        observed = el;
+        if (typeof ResizeObserver !== "undefined") {
+            new ResizeObserver(applyOffsets).observe(el);
+        }
+        applyOffsets();
+    }
+    attachCanvasObserver();
     body._titleSpan = titleSpan;
     body._miniBar = miniBar;
     return body;
