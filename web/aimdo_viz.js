@@ -399,6 +399,11 @@ function createPanel() {
     document.body.appendChild(panel);
     applyOffsets();
 
+    // re-anchor when the panel itself resizes (collapse/expand toggle, user drag-resize)
+    if (typeof ResizeObserver !== "undefined") {
+        new ResizeObserver(applyOffsets).observe(panel);
+    }
+
     // sidebar toggles don't fire window.resize, so observe the panel directly.
     // canvas may not exist during setup(), so poll until it does.
     let observed = null;
