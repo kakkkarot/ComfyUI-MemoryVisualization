@@ -309,6 +309,7 @@ function createPanel() {
     headerRight.style.cssText = "display:flex;align-items:center;gap:6px;";
 
     const intervalSelect = document.createElement("select");
+    intervalSelect.title = "Polling interval — how often the panel refreshes VRAM/RAM stats";
     intervalSelect.style.cssText = `font-size:9px;background:${C.btn};color:${C.btnText};border:none;border-radius:2px;padding:1px 2px;cursor:pointer;`;
     for (const ms of [100, 250, 500, 1000, 2000, 5000]) {
         const opt = document.createElement("option");
@@ -320,20 +321,69 @@ function createPanel() {
     intervalSelect.addEventListener("change", () => { pollInterval = parseInt(intervalSelect.value); saveState({ pollInterval }); });
 
     const unloadBtn = document.createElement("span");
-    unloadBtn.textContent = "unload";
+    unloadBtn.textContent = "unload ▾";
+    unloadBtn.title = "Unload models / free cache (click for options)";
     unloadBtn.style.cssText = `cursor:pointer;font-size:10px;padding:1px 6px;background:${C.btn};border-radius:3px;color:${C.btnText};`;
-    unloadBtn.addEventListener("click", async (e) => {
+
+    const unloadMenu = document.createElement("div");
+    unloadMenu.style.cssText = `
+        display:none; position:fixed; z-index:10001;
+        background:${C.headerBg}; color:${C.text};
+        border:1px solid ${C.border}; border-radius:4px;
+        padding:2px 0; min-width:160px;
+        box-shadow:0 4px 12px rgba(0,0,0,0.7);
+        font-family:monospace; font-size:10px;
+    `;
+    const unloadOptions = [
+        { label: "aimdo (immediate)", title: "Immediately unload aimdo-managed models", run: () =>
+            api.fetchApi("/aimdo/unload_all", { method: "POST" }) },
+        { label: "models", title: "ComfyUI /free — unload models on next queue tick", run: () =>
+            api.fetchApi("/free", { method: "POST",
+                body: JSON.stringify({ unload_models: true }),
+                headers: { "Content-Type": "application/json" } }) },
+        { label: "models + node cache", title: "ComfyUI /free — unload models and clear node output cache", run: () =>
+            api.fetchApi("/free", { method: "POST",
+                body: JSON.stringify({ unload_models: true, free_memory: true }),
+                headers: { "Content-Type": "application/json" } }) },
+    ];
+    for (const opt of unloadOptions) {
+        const item = document.createElement("div");
+        item.textContent = opt.label;
+        item.title = opt.title;
+        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+        item.addEventListener("mouseenter", () => item.style.background = C.btn);
+        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            unloadMenu.style.display = "none";
+            unloadBtn.textContent = "...";
+            try { await opt.run(); }
+            finally { unloadBtn.textContent = "unload ▾"; }
+        });
+        unloadMenu.appendChild(item);
+    }
+    document.body.appendChild(unloadMenu);
+
+    unloadBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        unloadBtn.textContent = "...";
-        try {
-            await api.fetchApi("/aimdo/unload_all", { method: "POST" });
-        } finally {
-            unloadBtn.textContent = "unload";
+        if (unloadMenu.style.display === "block") {
+            unloadMenu.style.display = "none";
+            return;
+        }
+        const r = unloadBtn.getBoundingClientRect();
+        unloadMenu.style.left = Math.max(4, r.right - 160) + "px";
+        unloadMenu.style.top = (r.bottom + 2) + "px";
+        unloadMenu.style.display = "block";
+    });
+    document.addEventListener("click", (e) => {
+        if (e.target !== unloadBtn && !unloadMenu.contains(e.target)) {
+            unloadMenu.style.display = "none";
         }
     });
 
     const resetBtn = document.createElement("span");
     resetBtn.textContent = "reset";
+    resetBtn.title = "Reset peak VRAM marker and clear history graph";
     resetBtn.style.cssText = `cursor:pointer;font-size:10px;padding:1px 6px;background:${C.btn};border-radius:3px;color:${C.btnText};`;
     resetBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -347,6 +397,7 @@ function createPanel() {
 
     const toggleBtn = document.createElement("span");
     toggleBtn.textContent = "\u2212";
+    toggleBtn.title = "Collapse / expand panel";
     toggleBtn.style.cssText = `cursor:pointer;font-size:16px;padding:0 4px;color:${C.btnText};`;
 
     const body = document.createElement("div");
@@ -584,7 +635,7 @@ function renderData(body, data) {
                 <span style="display:flex;align-items:center;gap:6px;">
                     <span>${formatBytes(m.total_size)}</span>
                     ${m.dynamic && data.aimdo_active ? `<span class="aimdo-reset-wm-btn" data-index="${m.index}" style="cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};" title="reset watermark">wm</span>` : ""}
-                    <span class="aimdo-unload-btn" data-index="${m.index}" style="cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};">x</span>
+                    <span class="aimdo-unload-btn" data-index="${m.index}" style="cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};" title="Unload this model">x</span>
                 </span>
             </div>`;
 
