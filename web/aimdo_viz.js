@@ -231,7 +231,7 @@ function createPanel() {
         background: ${C.bg}; color: ${C.text};
         border: 1px solid ${C.border}; border-radius: 8px;
         padding: 0; font-family: monospace; font-size: 12px;
-        z-index: 10000; min-width: 200px; width: 340px; max-height: 90vh;
+        z-index: 50; min-width: 200px; width: 340px; max-height: 90vh;
         box-shadow: 0 4px 12px rgba(0,0,0,0.7);
         user-select: none; resize: horizontal; overflow-y: auto;
     `;
@@ -324,7 +324,7 @@ function createPanel() {
 
     const unloadMenu = document.createElement("div");
     unloadMenu.style.cssText = `
-        display:none; position:fixed; z-index:10001;
+        display:none; position:fixed; z-index:51;
         background:${C.headerBg}; color:${C.text};
         border:1px solid ${C.border}; border-radius:4px;
         padding:2px 0; min-width:160px;
