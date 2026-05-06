@@ -550,10 +550,133 @@ function ensureStructure(body) {
         graphCanvas,
         graphCtx: graphCanvas.getContext("2d"),
         modelsDiv,
-        pageCanvases: {},   // keyed by model name
+        pageCanvases: {},   // keyed by `${index}_${vi}`
         pageCtxs: {},
+        modelRows: {},      // keyed by m.index — refs to mutable row parts
+        noModelsMsg: null,
+        bottomLegend: null,
     };
     return refs;
+}
+
+// build (or reuse) a model row, mutating only what changed
+function renderModelRow(r, m, data) {
+    const wantsWm = m.dynamic && data.aimdo_active;
+    const btnStyle = `cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};`;
+    let row = r.modelRows[m.index];
+    if (!row) {
+        const el = document.createElement("div");
+        el.style.cssText = "margin-top:6px;";
+        const head = document.createElement("div");
+        head.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;";
+        const nameSpan = document.createElement("span");
+        const right = document.createElement("span");
+        right.style.cssText = "display:flex;align-items:center;gap:6px;";
+        const sizeSpan = document.createElement("span");
+        right.appendChild(sizeSpan);
+        const unloadBtn = document.createElement("span");
+        unloadBtn.className = "aimdo-unload-btn";
+        unloadBtn.dataset.index = m.index;
+        unloadBtn.textContent = "x";
+        unloadBtn.title = "Unload this model";
+        unloadBtn.style.cssText = btnStyle;
+        right.appendChild(unloadBtn);
+        head.appendChild(nameSpan);
+        head.appendChild(right);
+        el.appendChild(head);
+        const bar = document.createElement("div");
+        bar.style.cssText = `background:${C.barBg};border-radius:3px;height:10px;overflow:hidden;display:flex;`;
+        el.appendChild(bar);
+        const legend = document.createElement("div");
+        legend.style.cssText = `display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;`;
+        el.appendChild(legend);
+        const vbarsDiv = document.createElement("div");
+        el.appendChild(vbarsDiv);
+        row = { el, nameSpan, sizeSpan, right, unloadBtn, bar, barSegs: [], legend, vbarsDiv, vbarRefs: [], wmBtn: null, lastDynamic: null, lastVbarSig: "" };
+        r.modelRows[m.index] = row;
+    }
+
+    row.nameSpan.textContent = m.name + (m.dynamic ? "" : " (static)");
+    row.sizeSpan.textContent = formatBytes(m.total_size);
+
+    if (wantsWm && !row.wmBtn) {
+        const wm = document.createElement("span");
+        wm.className = "aimdo-reset-wm-btn";
+        wm.dataset.index = m.index;
+        wm.textContent = "wm";
+        wm.title = "reset watermark";
+        wm.style.cssText = btnStyle;
+        row.right.insertBefore(wm, row.unloadBtn);
+        row.wmBtn = wm;
+    } else if (!wantsWm && row.wmBtn) {
+        row.wmBtn.remove();
+        row.wmBtn = null;
+    }
+
+    if (row.lastDynamic !== m.dynamic) {
+        row.bar.innerHTML = "";
+        row.barSegs = [];
+        for (const color of (m.dynamic ? [C.vram, C.pinned, C.unloaded] : [C.vram, C.pinned])) {
+            const seg = document.createElement("div");
+            seg.style.cssText = `background:${color};height:100%;`;
+            row.bar.appendChild(seg);
+            row.barSegs.push(seg);
+        }
+        row.lastDynamic = m.dynamic;
+    }
+
+    if (m.dynamic) {
+        const pinnedRam = m.pinned_ram || 0;
+        const unloadedSize = Math.max(0, m.total_size - m.vbar_loaded - pinnedRam);
+        const total = m.total_size || 1;
+        row.barSegs[0].style.width = (m.vbar_loaded / total * 100) + "%";
+        row.barSegs[0].title = "VRAM: " + formatBytes(m.vbar_loaded);
+        row.barSegs[1].style.width = (pinnedRam / total * 100) + "%";
+        row.barSegs[1].title = "pinned RAM: " + formatBytes(pinnedRam);
+        row.barSegs[2].style.width = (unloadedSize / total * 100) + "%";
+        row.barSegs[2].title = "unloaded: " + formatBytes(unloadedSize);
+        row.legend.innerHTML =
+            `<span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.vbar_loaded)}</span>` +
+            (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
+            `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded ${formatBytes(unloadedSize)}</span>`;
+    } else {
+        const inRam = Math.max(0, m.total_size - m.loaded_size);
+        const total = m.total_size || 1;
+        row.barSegs[0].style.width = (m.loaded_size / total * 100) + "%";
+        row.barSegs[0].title = "VRAM: " + formatBytes(m.loaded_size);
+        row.barSegs[1].style.width = (inRam / total * 100) + "%";
+        row.barSegs[1].title = "RAM: " + formatBytes(inRam);
+        row.legend.innerHTML =
+            `<span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.loaded_size)}</span>` +
+            (inRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> RAM ${formatBytes(inRam)}</span>` : "");
+    }
+
+    // vbars: rebuild structure only when device list / count changes
+    const vbars = (m.vbars || []).filter(v => v.residency && v.residency.length > 0);
+    const sig = vbars.map(v => v.device + ":" + v.residency.length).join("|");
+    if (row.lastVbarSig !== sig) {
+        row.vbarsDiv.innerHTML = "";
+        row.vbarRefs = [];
+        const showLabel = vbars.length > 1;
+        for (let vi = 0; vi < vbars.length; vi++) {
+            const vb = vbars[vi];
+            if (showLabel) {
+                const lbl = document.createElement("div");
+                lbl.style.cssText = `font-size:10px;color:${C.textDim};margin-top:3px;`;
+                lbl.textContent = vb.device;
+                row.vbarsDiv.appendChild(lbl);
+            }
+            const pgrid = document.createElement("div");
+            pgrid.style.cssText = "margin-top:2px;";
+            row.vbarsDiv.appendChild(pgrid);
+            const stats = document.createElement("div");
+            stats.style.cssText = `color:${C.textDim};font-size:10px;margin-top:2px;`;
+            row.vbarsDiv.appendChild(stats);
+            row.vbarRefs.push({ vi, pgrid, stats });
+        }
+        row.lastVbarSig = sig;
+    }
+    return row;
 }
 
 function renderData(body, data) {
@@ -663,124 +786,80 @@ function renderData(body, data) {
     if (r.graphCanvas.width !== displayW) r.graphCanvas.width = displayW;
     drawGraph(r.graphCtx, r.graphCanvas.width, r.graphCanvas.height);
 
-    // models section — only rebuild HTML for text parts, use canvas for page grids
-    let modelsHtml = "";
-
-    if (data.models.length === 0) {
-        modelsHtml += `<div style="color:${C.textDim};margin-top:6px;">No models loaded</div>`;
+    // models section — incremental DOM updates: keep rows across polls, only mutate text/widths
+    if (data.models.length === 0 && !r.noModelsMsg) {
+        r.noModelsMsg = document.createElement("div");
+        r.noModelsMsg.textContent = "No models loaded";
+        r.noModelsMsg.style.cssText = `color:${C.textDim};margin-top:6px;`;
+        r.modelsDiv.insertBefore(r.noModelsMsg, r.modelsDiv.firstChild);
+    } else if (data.models.length > 0 && r.noModelsMsg) {
+        r.noModelsMsg.remove();
+        r.noModelsMsg = null;
     }
 
-    for (const m of data.models) {
-        modelsHtml += `<div style="margin-top:6px;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;">
-                <span>${escHtml(m.name)}${m.dynamic ? "" : " (static)"}</span>
-                <span style="display:flex;align-items:center;gap:6px;">
-                    <span>${formatBytes(m.total_size)}</span>
-                    ${m.dynamic && data.aimdo_active ? `<span class="aimdo-reset-wm-btn" data-index="${m.index}" style="cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};" title="reset watermark">wm</span>` : ""}
-                    <span class="aimdo-unload-btn" data-index="${m.index}" style="cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};" title="Unload this model">x</span>
-                </span>
-            </div>`;
-
-        if (m.dynamic) {
-            const pinnedRam = m.pinned_ram || 0;
-            const unloadedSize = Math.max(0, m.total_size - m.vbar_loaded - pinnedRam);
-            const vramPct = m.total_size > 0 ? (m.vbar_loaded / m.total_size * 100) : 0;
-            const pinnedPct = m.total_size > 0 ? (pinnedRam / m.total_size * 100) : 0;
-            const unloadedPct = m.total_size > 0 ? (unloadedSize / m.total_size * 100) : 0;
-
-            modelsHtml += `<div style="background:${C.barBg};border-radius:3px;height:10px;overflow:hidden;display:flex;">
-                <div style="background:${C.vram};height:100%;width:${vramPct}%;" title="VRAM: ${formatBytes(m.vbar_loaded)}"></div>
-                <div style="background:${C.pinned};height:100%;width:${pinnedPct}%;" title="pinned RAM: ${formatBytes(pinnedRam)}"></div>
-                <div style="background:${C.unloaded};height:100%;width:${unloadedPct}%;" title="unloaded: ${formatBytes(unloadedSize)}"></div>
-            </div>
-            <div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
-                <span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.vbar_loaded)}</span>
-                ${pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : ""}
-                <span><span style="color:${C.unloaded};">&#9632;</span> unloaded ${formatBytes(unloadedSize)}</span>
-            </div>`;
-        } else {
-            const inRam = Math.max(0, m.total_size - m.loaded_size);
-            const vramPct = m.total_size > 0 ? (m.loaded_size / m.total_size * 100).toFixed(0) : 0;
-            const ramPct = m.total_size > 0 ? (inRam / m.total_size * 100).toFixed(0) : 0;
-            modelsHtml += `<div style="background:${C.barBg};border-radius:3px;height:10px;overflow:hidden;display:flex;">
-                <div style="background:${C.vram};height:100%;width:${vramPct}%;" title="VRAM: ${formatBytes(m.loaded_size)}"></div>
-                <div style="background:${C.pinned};height:100%;width:${ramPct}%;" title="RAM: ${formatBytes(inRam)}"></div>
-            </div>
-            <div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
-                <span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.loaded_size)}</span>
-                ${inRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> RAM ${formatBytes(inRam)}</span>` : ""}
-            </div>`;
-        }
-
-        if (m.vbars) {
-            for (let vi = 0; vi < m.vbars.length; vi++) {
-                const vb = m.vbars[vi];
-                if (!vb.residency || vb.residency.length === 0) continue;
-
-                const vkey = `${m.index}_${vi}`;
-                diffResidency(vkey, vb.residency);
-                let residentCount = 0, pinnedCount = 0;
-                for (let i = 0; i < vb.residency.length; i++) {
-                    const flag = vb.residency[i];
-                    if (flag & 2) pinnedCount++;
-                    else if (flag & 1) residentCount++;
-                }
-                const PAGE = 32 * 1024 * 1024;
-                const vramPages = residentCount + pinnedCount;
-                const ramPages = vb.residency.length - vramPages;
-
-                if (m.vbars.length > 1) {
-                    modelsHtml += `<div style="font-size:10px;color:${C.textDim};margin-top:3px;">${escHtml(vb.device)}</div>`;
-                }
-                modelsHtml += `<div id="aimdo-pgrid-${vkey}" style="margin-top:2px;"></div>`;
-                modelsHtml += `<div style="color:${C.textDim};font-size:10px;margin-top:2px;">
-                    <span style="color:${C.vram};">${vramPages} VRAM (${formatBytes(vramPages * PAGE)})</span> + <span style="color:${C.unloaded};">${ramPages} unloaded (${formatBytes(ramPages * PAGE)})</span>
-                </div>`;
-            }
-        }
-
-        modelsHtml += `</div>`;
-    }
-
-    modelsHtml += `<div style="display:flex;flex-wrap:wrap;gap:8px;font-size:10px;color:${C.textDim};margin-top:6px;border-top:1px solid ${C.border};padding-top:4px;">
-        <span><span style="color:${C.vram};">&#9632;</span> VRAM</span>
-        <span><span style="color:${C.pinned};">&#9632;</span> pinned</span>
-        <span><span style="color:${C.unloaded};">&#9632;</span> unloaded</span>
-        <span><span style="color:${C.torch};">&#9632;</span> torch</span>
-        <span><span style="color:${C.totalLine};">&#9472;</span> total used</span>
-    </div>`;
-
-    r.modelsDiv.innerHTML = modelsHtml;
-
-    // collect active vbar keys for cleanup
-    const activeKeys = new Set();
-    for (const m of data.models) {
-        if (!m.vbars) continue;
-        for (let vi = 0; vi < m.vbars.length; vi++) {
-            activeKeys.add(`${m.index}_${vi}`);
+    // remove rows for models no longer present and clean up their canvas refs
+    const liveIndices = new Set(data.models.map(m => m.index));
+    for (const idx of Object.keys(r.modelRows)) {
+        if (!liveIndices.has(parseInt(idx))) {
+            r.modelRows[idx].el.remove();
+            delete r.modelRows[idx];
         }
     }
-
-    // clean up stale refs for models no longer present
     for (const key of Object.keys(r.pageCanvases)) {
-        if (!activeKeys.has(key)) {
+        const idx = parseInt(key.split("_")[0]);
+        if (!liveIndices.has(idx)) {
             delete r.pageCanvases[key];
             delete r.pageCtxs[key];
             delete modelState[key];
         }
     }
 
-    // draw page grids into their placeholder divs using canvas
+    // create/update each row, append new ones before the bottom legend
     for (const m of data.models) {
-        if (!m.vbars) continue;
-        for (let vi = 0; vi < m.vbars.length; vi++) {
-            const vb = m.vbars[vi];
-            if (!vb.residency || vb.residency.length === 0) continue;
+        const isNew = !r.modelRows[m.index];
+        const row = renderModelRow(r, m, data);
+        if (isNew) {
+            if (r.bottomLegend) r.modelsDiv.insertBefore(row.el, r.bottomLegend);
+            else r.modelsDiv.appendChild(row.el);
+        }
+    }
 
-            const vkey = `${m.index}_${vi}`;
-            const st = modelState[vkey];
-            const container = r.modelsDiv.querySelector(`#aimdo-pgrid-${vkey}`);
-            if (!container) continue;
+    // bottom legend — created once
+    if (!r.bottomLegend) {
+        r.bottomLegend = document.createElement("div");
+        r.bottomLegend.style.cssText = `display:flex;flex-wrap:wrap;gap:8px;font-size:10px;color:${C.textDim};margin-top:6px;border-top:1px solid ${C.border};padding-top:4px;`;
+        r.bottomLegend.innerHTML =
+            `<span><span style="color:${C.vram};">&#9632;</span> VRAM</span>` +
+            `<span><span style="color:${C.pinned};">&#9632;</span> pinned</span>` +
+            `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded</span>` +
+            `<span><span style="color:${C.torch};">&#9632;</span> torch</span>` +
+            `<span><span style="color:${C.totalLine};">&#9472;</span> total used</span>`;
+        r.modelsDiv.appendChild(r.bottomLegend);
+    }
+
+    // draw page grids and update vbar stat text
+    for (const m of data.models) {
+        const row = r.modelRows[m.index];
+        if (!row || !row.vbarRefs.length) continue;
+        const vbars = (m.vbars || []).filter(v => v.residency && v.residency.length > 0);
+        for (let vi = 0; vi < row.vbarRefs.length; vi++) {
+            const vb = vbars[vi];
+            if (!vb) continue;
+            const ref = row.vbarRefs[vi];
+            const vkey = `${m.index}_${ref.vi}`;
+            const st = diffResidency(vkey, vb.residency);
+            let residentCount = 0, pinnedCount = 0;
+            for (let i = 0; i < vb.residency.length; i++) {
+                const flag = vb.residency[i];
+                if (flag & 2) pinnedCount++;
+                else if (flag & 1) residentCount++;
+            }
+            const PAGE = 32 * 1024 * 1024;
+            const vramPages = residentCount + pinnedCount;
+            const ramPages = vb.residency.length - vramPages;
+            ref.stats.innerHTML =
+                `<span style="color:${C.vram};">${vramPages} VRAM (${formatBytes(vramPages * PAGE)})</span>` +
+                ` + <span style="color:${C.unloaded};">${ramPages} unloaded (${formatBytes(ramPages * PAGE)})</span>`;
 
             let canvas = r.pageCanvases[vkey];
             if (!canvas) {
@@ -789,8 +868,8 @@ function renderData(body, data) {
                 r.pageCanvases[vkey] = canvas;
                 r.pageCtxs[vkey] = canvas.getContext("2d");
             }
-            canvas.width = container.clientWidth || r.modelsDiv.clientWidth || 300;
-            container.appendChild(canvas);
+            if (canvas.parentElement !== ref.pgrid) ref.pgrid.appendChild(canvas);
+            canvas.width = ref.pgrid.clientWidth || r.modelsDiv.clientWidth || 300;
             drawPageGrid(r.pageCtxs[vkey], canvas.width, vb.residency, st ? st.changeAge : new Uint8Array(vb.residency.length));
         }
     }
