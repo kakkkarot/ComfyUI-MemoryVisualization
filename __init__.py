@@ -103,6 +103,16 @@ async def aimdo_vram_status(request):
     # driver-level free/total (matches nvitop)
     free_cuda, total_vram = torch.cuda.mem_get_info(device)
 
+    try:
+        gpu_util = torch.cuda.utilization(device)
+    except Exception:
+        gpu_util = None
+
+    try:
+        gpu_temp = torch.cuda.temperature(device)
+    except Exception:
+        gpu_temp = None
+
     # pytorch internal stats
     stats = torch.cuda.memory_stats(device)
     torch_active = stats.get('active_bytes.all.current', 0)
@@ -117,6 +127,8 @@ async def aimdo_vram_status(request):
         "aimdo_active": aimdo_active,
         "total_vram": total_vram,
         "free_vram": free_cuda,
+        "gpu_util": gpu_util,
+        "gpu_temp": gpu_temp,
         "aimdo_usage": aimdo_usage,
         "torch_active": torch_active,
         "torch_reserved": torch_reserved,

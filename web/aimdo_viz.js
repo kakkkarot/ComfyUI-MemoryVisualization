@@ -7,6 +7,8 @@ const GRAPH_POINTS = 120;
 
 const execState = { running: false, node: null, progress: null };
 let peakVramUsed = 0;
+let gpuLineVisible = true;
+let modelCollapsed = {};
 
 const STORAGE_KEY = "aimdo_viz_state";
 function loadState() {
@@ -39,6 +41,8 @@ const C = {
     graphBg:    "#0e0e0e",
     gridLine:   "#1e1e1e",
     totalLine:  "#d0d0d0",
+    gpuUtil:    "#f1c40f",
+    gpuUtilHi:  "#e74c3c",
     capLine:    "#555",
     barBg:      "#222",
     fadeInFrom:  [255, 220, 0],
@@ -50,6 +54,18 @@ const C = {
 
 function escHtml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function gpuUtilColor(pct) {
+    if (pct < 10) return C.textDim;
+    if (pct < 80) return C.gpuUtil;
+    return C.gpuUtilHi;
+}
+
+function gpuTempColor(c) {
+    if (c < 60) return C.textDim;
+    if (c < 80) return C.gpuUtil;
+    return C.gpuUtilHi;
 }
 
 function formatBytes(bytes) {
@@ -64,10 +80,26 @@ const history = {
     torch_active: new Float64Array(GRAPH_POINTS),
     aimdo_usage: new Float64Array(GRAPH_POINTS),
     free_vram: new Float64Array(GRAPH_POINTS),
+    gpu_util: new Float64Array(GRAPH_POINTS),
     total_vram: 1,
     head: 0,
     len: 0,
 };
+
+// NVML util frequently dips to 0 mid-workload; peak-hold preserves real peaks.
+const GPU_SMOOTH_WINDOW = 3;
+const gpuRawBuf = [];
+function smoothGpuUtil(raw) {
+    if (raw == null) {
+        gpuRawBuf.length = 0;
+        return null;
+    }
+    gpuRawBuf.push(raw);
+    if (gpuRawBuf.length > GPU_SMOOTH_WINDOW) gpuRawBuf.shift();
+    let m = 0;
+    for (const v of gpuRawBuf) if (v > m) m = v;
+    return m;
+}
 
 function pushHistory(data) {
     history.total_vram = data.total_vram;
@@ -81,6 +113,7 @@ function pushHistory(data) {
         history.torch_active[i] = data.torch_active;
     }
     history.free_vram[i] = data.free_vram;
+    history.gpu_util[i] = data.gpu_util != null ? data.gpu_util : 0;
     history.head = (i + 1) % GRAPH_POINTS;
     if (history.len < GRAPH_POINTS) history.len++;
 }
@@ -156,6 +189,19 @@ function drawGraph(ctx, w, h) {
     ctx.lineTo(w, yFor(total));
     ctx.stroke();
     ctx.setLineDash([]);
+
+    // gpu line uses its own 0..100 scale, not the VRAM byte scale
+    if (gpuLineVisible) {
+        ctx.beginPath();
+        ctx.strokeStyle = C.gpuUtil;
+        ctx.lineWidth = 1.25;
+        for (let i = 0; i < len; i++) {
+            const x = (GRAPH_POINTS - len + i) * stepX;
+            const y = h - (historyGet(history.gpu_util, i) / 100) * h;
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+    }
 }
 
 // per-model residency diff state
@@ -223,6 +269,8 @@ function drawPageGrid(ctx, w, residency, changeAge) {
 function createPanel() {
     const saved = loadState();
     if (saved.pollInterval) pollInterval = saved.pollInterval;
+    if (typeof saved.gpuLineVisible === "boolean") gpuLineVisible = saved.gpuLineVisible;
+    if (saved.modelCollapsed && typeof saved.modelCollapsed === "object") modelCollapsed = saved.modelCollapsed;
 
     const panel = document.createElement("div");
     panel.id = "aimdo-viz-panel";
@@ -258,30 +306,96 @@ function createPanel() {
     let rightOffset = saved.rightOffset != null ? saved.rightOffset : 10;
     let bottomOffset = saved.bottomOffset != null ? saved.bottomOffset : 10;
 
-    // viewport bounds for left/right/bottom; the lowest visible top-chrome
-    // element for the top edge, so the panel can't slide under ComfyUI's
-    // topbar / workflow tabs (which have higher z-index than us)
-    function getTopChromeBottom() {
-        const sels = [".comfyui-body-top", ".topbar-container", ".workflow-tabs-container", ".workflow-tabs"];
+    // ComfyUI's topbar / workflow tabs have higher z-index than us, so the
+    // panel must clamp below them. Leaf bars (transparent bg) only block where
+    // their items actually sit, letting the panel rise into empty regions.
+    function getTopChromeBottom(panelLeft, panelRight) {
+        const fullSels = [".comfyui-body-top", ".topbar-container", ".workflow-tabs-container", ".workflow-tabs"];
+        const leafSels = [".actionbar-container"];
         let bottom = 0;
-        for (const s of sels) {
+        for (const s of fullSels) {
             for (const el of document.querySelectorAll(s)) {
                 const r = el.getBoundingClientRect();
                 if (r.height > 0 && r.bottom > bottom) bottom = r.bottom;
             }
         }
+        if (panelLeft == null) {
+            for (const s of leafSels) {
+                for (const el of document.querySelectorAll(s)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.height > 0 && r.bottom > bottom) bottom = r.bottom;
+                }
+            }
+            return bottom;
+        }
+        for (const s of leafSels) {
+            for (const el of document.querySelectorAll(s)) {
+                const r = el.getBoundingClientRect();
+                if (r.height <= 0) continue;
+                if (r.right <= panelLeft || r.left >= panelRight) continue;
+                for (const node of el.querySelectorAll("*")) {
+                    if (node.children.length > 0) continue;
+                    const nr = node.getBoundingClientRect();
+                    if (nr.width <= 0 || nr.height <= 0) continue;
+                    if (nr.right <= panelLeft || nr.left >= panelRight) continue;
+                    if (nr.bottom > bottom) bottom = nr.bottom;
+                }
+            }
+        }
         return bottom;
     }
+
+    // left-axis mirror of getTopChromeBottom for the side toolbar.
+    function getLeftChromeRight(panelTop, panelBottom) {
+        const leafSels = [".side-toolbar-container"];
+        let right = 0;
+        if (panelTop == null) {
+            for (const s of leafSels) {
+                for (const el of document.querySelectorAll(s)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.right > right) right = r.right;
+                }
+            }
+            return right;
+        }
+        for (const s of leafSels) {
+            for (const el of document.querySelectorAll(s)) {
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0) continue;
+                if (r.bottom <= panelTop || r.top >= panelBottom) continue;
+                for (const node of el.querySelectorAll("*")) {
+                    if (node.children.length > 0) continue;
+                    const nr = node.getBoundingClientRect();
+                    if (nr.width <= 0 || nr.height <= 0) continue;
+                    if (nr.bottom <= panelTop || nr.top >= panelBottom) continue;
+                    if (nr.right > right) right = nr.right;
+                }
+            }
+        }
+        return right;
+    }
+
     function clampOffsets(ro, bo) {
         const b = getCanvasBounds();
         const w = panel.offsetWidth, h = panel.offsetHeight;
         const vw = window.innerWidth, vh = window.innerHeight;
-        const minTop = getTopChromeBottom();
-        return {
-            ro: Math.max(b.right - vw, Math.min(ro, b.right - w)),
-            bo: Math.max(b.bottom - vh, Math.min(bo, b.bottom - h - minTop)),
-            b, w, h,
-        };
+        const panelRight = b.right - ro;
+        const panelLeft = panelRight - w;
+        const panelTop = b.bottom - bo - h;
+        const panelBottom = b.bottom - bo;
+        const minTop = getTopChromeBottom(panelLeft, panelRight);
+        const minLeft = getLeftChromeRight(panelTop, panelBottom);
+
+        // when window's too short for both constraints, prefer the chrome
+        // clamp over the viewport edge so we never overlap the topbar/sidebar.
+        const boHi = b.bottom - h - minTop;
+        const boLo = b.bottom - vh;
+        const boClamped = boHi < boLo ? boHi : Math.max(boLo, Math.min(bo, boHi));
+
+        const roHi = b.right - w - minLeft;
+        const roLo = b.right - vw;
+        const roClamped = roHi < roLo ? roHi : Math.max(roLo, Math.min(ro, roHi));
+        return { ro: roClamped, bo: boClamped, b, w, h };
     }
 
     // visual-only clamp; closure offsets stay as user intent so they survive temporary shrinks
@@ -314,7 +428,11 @@ function createPanel() {
     <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
         <span>VRAM</span><span class="mini-vram-usage"></span>
     </div>
-    <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;" class="mini-vram-bar"></div>`;
+    <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-vram-bar"></div>
+    <div style="display:flex;justify-content:space-between;margin-bottom:2px;" class="mini-gpu-row">
+        <span>GPU</span><span class="mini-gpu-usage"></span>
+    </div>
+    <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;" class="mini-gpu-bar"></div>`;
 
     const headerRight = document.createElement("div");
     headerRight.style.cssText = "display:flex;align-items:center;gap:6px;";
@@ -404,6 +522,7 @@ function createPanel() {
         history.torch_active.fill(0);
         history.aimdo_usage.fill(0);
         history.free_vram.fill(0);
+        history.gpu_util.fill(0);
     });
 
     const toggleBtn = document.createElement("span");
@@ -570,6 +689,14 @@ function ensureStructure(body) {
 
     const contentDiv = document.createElement("div");
     contentDiv.id = "aimdo-content";
+    contentDiv.addEventListener("click", (e) => {
+        const t = e.target.closest(".aimdo-gpu-util");
+        if (!t) return;
+        gpuLineVisible = !gpuLineVisible;
+        saveState({ gpuLineVisible });
+        if (refs) drawGraph(refs.graphCtx, refs.graphCanvas.width, refs.graphCanvas.height);
+        t.style.opacity = gpuLineVisible ? "1" : "0.4";
+    });
     body.appendChild(contentDiv);
 
     const graphCanvas = document.createElement("canvas");
@@ -596,6 +723,13 @@ function ensureStructure(body) {
     return refs;
 }
 
+function applyRowCollapsed(row) {
+    row.bar.style.display = row.collapsed ? "none" : "flex";
+    row.legend.style.display = row.collapsed ? "none" : "flex";
+    row.vbarsDiv.style.display = row.collapsed ? "none" : "";
+    row.chevron.textContent = row.collapsed ? "▸" : "▾";
+}
+
 // build (or reuse) a model row, mutating only what changed
 function renderModelRow(r, m, data) {
     const wantsWm = m.dynamic && data.aimdo_active;
@@ -606,7 +740,16 @@ function renderModelRow(r, m, data) {
         el.style.cssText = "margin-top:6px;";
         const head = document.createElement("div");
         head.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;";
+        const nameWrap = document.createElement("span");
+        nameWrap.style.cssText = "cursor:pointer;user-select:none;padding:1px 4px;margin:-1px -4px;border-radius:3px;transition:background 0.1s;";
+        nameWrap.title = "Click to collapse/expand";
+        nameWrap.addEventListener("mouseenter", () => { nameWrap.style.background = C.btn; });
+        nameWrap.addEventListener("mouseleave", () => { nameWrap.style.background = ""; });
+        const chevron = document.createElement("span");
+        chevron.style.cssText = `color:${C.textDim};margin-right:4px;font-size:9px;`;
         const nameSpan = document.createElement("span");
+        nameWrap.appendChild(chevron);
+        nameWrap.appendChild(nameSpan);
         const right = document.createElement("span");
         right.style.cssText = "display:flex;align-items:center;gap:6px;";
         const sizeSpan = document.createElement("span");
@@ -618,7 +761,7 @@ function renderModelRow(r, m, data) {
         unloadBtn.title = "Unload this model";
         unloadBtn.style.cssText = btnStyle;
         right.appendChild(unloadBtn);
-        head.appendChild(nameSpan);
+        head.appendChild(nameWrap);
         head.appendChild(right);
         el.appendChild(head);
         const bar = document.createElement("div");
@@ -629,7 +772,15 @@ function renderModelRow(r, m, data) {
         el.appendChild(legend);
         const vbarsDiv = document.createElement("div");
         el.appendChild(vbarsDiv);
-        row = { el, nameSpan, sizeSpan, right, unloadBtn, bar, barSegs: [], legend, vbarsDiv, vbarRefs: [], wmBtn: null, lastDynamic: null, lastVbarSig: "" };
+        row = { el, chevron, nameSpan, sizeSpan, right, unloadBtn, bar, barSegs: [], legend, vbarsDiv, vbarRefs: [], wmBtn: null, lastDynamic: null, lastVbarSig: "", collapsed: false };
+        nameWrap.addEventListener("click", () => {
+            row.collapsed = !row.collapsed;
+            modelCollapsed[m.name] = row.collapsed;
+            saveState({ modelCollapsed });
+            applyRowCollapsed(row);
+        });
+        row.collapsed = !!modelCollapsed[m.name];
+        applyRowCollapsed(row);
         r.modelRows[m.index] = row;
     }
 
@@ -728,6 +879,7 @@ function renderData(body, data) {
     body._titleSpan.textContent =
         pw >= 320 && data.aimdo_active ? "Memory (aimdo)" :
         pw >= 240 ? "Memory" : "";
+    data.gpu_util = smoothGpuUtil(data.gpu_util);
     pushHistory(data);
 
     const used = data.total_vram - data.free_vram;
@@ -778,6 +930,24 @@ function renderData(body, data) {
         `<div style="background:${C.python};height:100%;width:${pythonOtherPct}%;"></div>` +
         `<div style="background:${C.other};height:100%;width:${ramOtherPct}%;"></div>`;
 
+    const gpuRow = mb.querySelector(".mini-gpu-row");
+    const gpuBar = mb.querySelector(".mini-gpu-bar");
+    if (data.gpu_util != null) {
+        gpuRow.style.display = "flex";
+        gpuBar.style.display = "flex";
+        const gpuColor = gpuUtilColor(data.gpu_util);
+        const pctStr = (data.gpu_util < 10 ? "0" : "") + data.gpu_util + "%";
+        const tempStr = data.gpu_temp != null
+            ? ` <span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}&deg;C</span>`
+            : "";
+        mb.querySelector(".mini-gpu-usage").innerHTML =
+            `<span style="color:${gpuColor};">${pctStr}</span>${tempStr}`;
+        gpuBar.innerHTML = `<div style="background:${gpuColor};height:100%;width:${data.gpu_util}%;"></div>`;
+    } else {
+        gpuRow.style.display = "none";
+        gpuBar.style.display = "none";
+    }
+
     r.contentDiv.innerHTML = `<div style="margin-bottom:4px;">
         <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
             <span>RAM</span>
@@ -814,6 +984,8 @@ function renderData(body, data) {
         <div style="display:flex;gap:10px;font-size:10px;color:${C.textDim};margin-top:2px;">
             <span>peak: ${formatBytes(peakVramUsed)}</span>
             <span>cache: ${formatBytes(data.torch_reserved - data.torch_active)}</span>
+            ${data.gpu_util != null ? `<span class="aimdo-gpu-util" title="Click to toggle GPU line on graph" style="color:${gpuUtilColor(data.gpu_util)};cursor:pointer;opacity:${gpuLineVisible ? 1 : 0.4};">GPU ${data.gpu_util < 10 ? "0" : ""}${data.gpu_util}%</span>` : ""}
+            ${data.gpu_temp != null ? `<span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}&deg;C</span>` : ""}
             ${execState.running ? `<span style="color:${C.running};">&#9679; ${execState.node || "running"}${execState.progress ? " " + execState.progress : ""}</span>` : `<span>&#9679; idle</span>`}
         </div>
     </div>`;
@@ -851,33 +1023,29 @@ function renderData(body, data) {
         }
     }
 
-    // create/update each row, append new ones before the bottom legend
-    for (const m of data.models) {
-        const isNew = !r.modelRows[m.index];
-        const row = renderModelRow(r, m, data);
-        if (isNew) {
-            if (r.bottomLegend) r.modelsDiv.insertBefore(row.el, r.bottomLegend);
-            else r.modelsDiv.appendChild(row.el);
-        }
-    }
-
-    // bottom legend — created once
     if (!r.bottomLegend) {
         r.bottomLegend = document.createElement("div");
-        r.bottomLegend.style.cssText = `display:flex;flex-wrap:wrap;gap:8px;font-size:10px;color:${C.textDim};margin-top:6px;border-top:1px solid ${C.border};padding-top:4px;`;
+        r.bottomLegend.style.cssText = `display:flex;flex-wrap:wrap;gap:8px;font-size:10px;color:${C.textDim};margin-top:4px;border-bottom:1px solid ${C.border};padding-bottom:4px;`;
         r.bottomLegend.innerHTML =
             `<span><span style="color:${C.vram};">&#9632;</span> VRAM</span>` +
             `<span><span style="color:${C.pinned};">&#9632;</span> pinned</span>` +
             `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded</span>` +
             `<span><span style="color:${C.torch};">&#9632;</span> torch</span>` +
-            `<span><span style="color:${C.totalLine};">&#9472;</span> total used</span>`;
-        r.modelsDiv.appendChild(r.bottomLegend);
+            `<span><span style="color:${C.totalLine};">&#9472;</span> total used</span>` +
+            `<span><span style="color:${C.gpuUtil};">&#9472;</span> GPU %</span>`;
+        r.modelsDiv.insertBefore(r.bottomLegend, r.modelsDiv.firstChild);
+    }
+
+    for (const m of data.models) {
+        const isNew = !r.modelRows[m.index];
+        const row = renderModelRow(r, m, data);
+        if (isNew) r.modelsDiv.appendChild(row.el);
     }
 
     // draw page grids and update vbar stat text
     for (const m of data.models) {
         const row = r.modelRows[m.index];
-        if (!row || !row.vbarRefs.length) continue;
+        if (!row || !row.vbarRefs.length || row.collapsed) continue;
         const vbars = (m.vbars || []).filter(v => v.residency && v.residency.length > 0);
         for (let vi = 0; vi < row.vbarRefs.length; vi++) {
             const vb = vbars[vi];
