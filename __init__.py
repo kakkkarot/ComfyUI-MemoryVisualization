@@ -18,6 +18,37 @@ try:
 except ImportError:
     comfy_aimdo = None
 
+# NVML handle + power-cap cache. Cap is static for a given driver state,
+# so we only query it once. Handle init is best-effort; failures stick.
+_nvml_state = {"handle": None, "tried": False, "power_limit": None}
+
+def _nvml_handle(device):
+    if _nvml_state["tried"]:
+        return _nvml_state["handle"]
+    _nvml_state["tried"] = True
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        idx = device.index if device.index is not None else 0
+        _nvml_state["handle"] = pynvml.nvmlDeviceGetHandleByIndex(idx)
+    except Exception as e:
+        log.debug("aimdo-viz: pynvml init failed: %s", e)
+    return _nvml_state["handle"]
+
+def _nvml_power_limit(device):
+    if _nvml_state["power_limit"] is not None:
+        return _nvml_state["power_limit"]
+    h = _nvml_handle(device)
+    if h is None:
+        return None
+    try:
+        import pynvml
+        _nvml_state["power_limit"] = pynvml.nvmlDeviceGetPowerManagementLimit(h)
+        return _nvml_state["power_limit"]
+    except Exception as e:
+        log.debug("aimdo-viz: nvmlDeviceGetPowerManagementLimit failed: %s", e)
+        return None
+
 def _get_lock():
     # Stored on comfy.model_management so the same lock survives hot reloads.
     mm = comfy.model_management
@@ -113,6 +144,12 @@ async def aimdo_vram_status(request):
     except Exception:
         gpu_temp = None
 
+    try:
+        gpu_power = torch.cuda.power_draw(device)  # mW
+    except Exception:
+        gpu_power = None
+    gpu_power_limit = _nvml_power_limit(device)  # mW
+
     # pytorch internal stats
     stats = torch.cuda.memory_stats(device)
     torch_active = stats.get('active_bytes.all.current', 0)
@@ -129,6 +166,8 @@ async def aimdo_vram_status(request):
         "free_vram": free_cuda,
         "gpu_util": gpu_util,
         "gpu_temp": gpu_temp,
+        "gpu_power": gpu_power,
+        "gpu_power_limit": gpu_power_limit,
         "aimdo_usage": aimdo_usage,
         "torch_active": torch_active,
         "torch_reserved": torch_reserved,

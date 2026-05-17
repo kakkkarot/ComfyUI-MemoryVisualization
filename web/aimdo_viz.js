@@ -68,6 +68,19 @@ function gpuTempColor(c) {
     return C.gpuUtilHi;
 }
 
+function gpuPowerColor(draw_mW, limit_mW) {
+    if (draw_mW == null) return C.textDim;
+    if (limit_mW == null || limit_mW <= 0) return C.gpuUtil;
+    return gpuUtilColor(draw_mW / limit_mW * 100);
+}
+
+function formatPower(draw_mW, limit_mW) {
+    if (draw_mW == null) return null;
+    const draw = Math.round(draw_mW / 1000);
+    if (limit_mW == null || limit_mW <= 0) return `${draw}W`;
+    return `${draw}/${Math.round(limit_mW / 1000)}W`;
+}
+
 function formatBytes(bytes) {
     if (bytes == null) return "?";
     if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
@@ -226,18 +239,27 @@ function diffResidency(key, residency) {
     return st;
 }
 
-// draw page grid to canvas — much faster than 700 DOM divs
-function drawPageGrid(ctx, w, residency, changeAge) {
+// draw page grid to canvas — much faster than 700 DOM divs.
+// cssW is logical (panel-local) drawing width; panelScale combines with devicePixelRatio
+// so backing pixels match the device while cells stay 6 logical px (scaling with panel zoom).
+function drawPageGrid(ctx, cssW, residency, changeAge, panelScale) {
     const cellSize = 6;
     const gap = 1;
     const step = cellSize + gap;
-    const cols = Math.floor((w + gap) / step);
+    const cols = Math.max(1, Math.floor((cssW + gap) / step));
     const rows = Math.ceil(residency.length / cols);
-    const h = rows * step;
+    const cssH = rows * step;
 
-    ctx.canvas.height = h || 1;
-    ctx.canvas.style.height = (h || 1) + "px";
-    ctx.clearRect(0, 0, w, h);
+    const dpr = window.devicePixelRatio || 1;
+    const totalScale = panelScale * dpr;
+    const canvas = ctx.canvas;
+    const backingW = Math.max(1, Math.round(cssW * totalScale));
+    const backingH = Math.max(1, Math.round((cssH || 1) * totalScale));
+    if (canvas.width !== backingW) canvas.width = backingW;
+    if (canvas.height !== backingH) canvas.height = backingH;
+    canvas.style.height = (cssH || 1) + "px";
+    ctx.setTransform(totalScale, 0, 0, totalScale, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH || 1);
 
     // batch: draw all static vram cells, then all static unloaded, then animated individually
     const animated = [];
@@ -271,6 +293,7 @@ function createPanel() {
     if (saved.pollInterval) pollInterval = saved.pollInterval;
     if (typeof saved.gpuLineVisible === "boolean") gpuLineVisible = saved.gpuLineVisible;
     if (saved.modelCollapsed && typeof saved.modelCollapsed === "object") modelCollapsed = saved.modelCollapsed;
+    let panelScale = typeof saved.scale === "number" ? saved.scale : 1;
 
     const panel = document.createElement("div");
     panel.id = "aimdo-viz-panel";
@@ -283,7 +306,18 @@ function createPanel() {
         box-shadow: 0 4px 12px rgba(0,0,0,0.7);
         user-select: none; resize: horizontal; overflow-y: auto;
     `;
-    if (saved.width != null) panel.style.width = Math.min(saved.width, window.innerWidth) + "px";
+    panel.style.zoom = panelScale;
+    panel._scale = panelScale;
+    if (saved.width != null) panel.style.width = Math.min(saved.width, window.innerWidth) / panelScale + "px";
+
+    // CSS min/max-width/height are pre-zoom (logical), so divide visual targets
+    // by panelScale to land at the intended viewport-pixel limits.
+    function applyConstraints() {
+        panel.style.minWidth = (200 / panelScale) + "px";
+        panel.style.maxWidth = (window.innerWidth / panelScale) + "px";
+        panel.style.maxHeight = (window.innerHeight * 0.9 / panelScale) + "px";
+    }
+    applyConstraints();
 
     // .graph-canvas-panel shrinks when sidebars open; #graph-canvas-container doesn't
     function getCanvasEl() {
@@ -377,7 +411,8 @@ function createPanel() {
 
     function clampOffsets(ro, bo) {
         const b = getCanvasBounds();
-        const w = panel.offsetWidth, h = panel.offsetHeight;
+        const pr = panel.getBoundingClientRect();
+        const w = pr.width, h = pr.height;
         const vw = window.innerWidth, vh = window.innerHeight;
         const panelRight = b.right - ro;
         const panelLeft = panelRight - w;
@@ -398,15 +433,17 @@ function createPanel() {
         return { ro: roClamped, bo: boClamped, b, w, h };
     }
 
-    // visual-only clamp; closure offsets stay as user intent so they survive temporary shrinks
+    // visual-only clamp; closure offsets stay as user intent so they survive temporary shrinks.
+    // CSS zoom scales style.left/top along with size, so we divide by panelScale to land at
+    // the intended viewport position rather than position × scale.
     function applyOffsets() {
         const { ro, bo, b, w, h } = clampOffsets(rightOffset, bottomOffset);
-        panel.style.left = (b.right - w - ro) + "px";
-        panel.style.top = (b.bottom - h - bo) + "px";
+        panel.style.left = ((b.right - w - ro) / panelScale) + "px";
+        panel.style.top = ((b.bottom - h - bo) / panelScale) + "px";
         panel.style.right = "auto";
         panel.style.bottom = "auto";
     }
-    window.addEventListener("resize", applyOffsets);
+    window.addEventListener("resize", () => { applyConstraints(); applyOffsets(); });
 
     const header = document.createElement("div");
     header.style.cssText = `
@@ -500,8 +537,10 @@ function createPanel() {
             return;
         }
         const r = unloadBtn.getBoundingClientRect();
-        unloadMenu.style.left = Math.max(4, r.right - 160) + "px";
-        unloadMenu.style.top = (r.bottom + 2) + "px";
+        unloadMenu.style.zoom = panelScale;
+        // style.left/top are pre-zoom on a zoomed element, divide visual targets by scale
+        unloadMenu.style.left = (Math.max(4, r.right - 160 * panelScale) / panelScale) + "px";
+        unloadMenu.style.top = ((r.bottom + 2) / panelScale) + "px";
         unloadMenu.style.display = "block";
     });
     document.addEventListener("click", (e) => {
@@ -560,9 +599,11 @@ function createPanel() {
 
     let dragging = false, dx = 0, dy = 0;
     header.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
         dragging = true;
-        dx = e.clientX - panel.offsetLeft;
-        dy = e.clientY - panel.offsetTop;
+        const r = panel.getBoundingClientRect();
+        dx = e.clientX - r.left;
+        dy = e.clientY - r.top;
     });
     // Ctrl/Cmd + mousedown anywhere on the panel starts a drag — capture phase
     // so we intercept before child elements (buttons, edge handles) react
@@ -576,8 +617,9 @@ function createPanel() {
         e.preventDefault();
         e.stopPropagation();
         dragging = true;
-        dx = e.clientX - panel.offsetLeft;
-        dy = e.clientY - panel.offsetTop;
+        const r = panel.getBoundingClientRect();
+        dx = e.clientX - r.left;
+        dy = e.clientY - r.top;
     }, true);
     // suppress the click that follows a Ctrl+drag so a Ctrl+click on a button
     // doesn't trigger its action after the drag ends
@@ -590,9 +632,9 @@ function createPanel() {
     document.addEventListener("mousemove", (e) => {
         if (!dragging) return;
         const b = getCanvasBounds();
-        const w = panel.offsetWidth, h = panel.offsetHeight;
-        rightOffset = b.right - (e.clientX - dx) - w;
-        bottomOffset = b.bottom - (e.clientY - dy) - h;
+        const r = panel.getBoundingClientRect();
+        rightOffset = b.right - (e.clientX - dx) - r.width;
+        bottomOffset = b.bottom - (e.clientY - dy) - r.height;
         applyOffsets();
     });
     document.addEventListener("mouseup", () => {
@@ -616,9 +658,10 @@ function createPanel() {
         h.title = "Drag to resize";
         h.style.cssText = `position:absolute;top:28px;bottom:0;${side}:0;width:4px;cursor:ew-resize;z-index:1;`;
         h.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
             e.preventDefault();
             e.stopPropagation();
-            edgeDrag = { side, startX: e.clientX, startWidth: panel.offsetWidth };
+            edgeDrag = { side, startX: e.clientX, startWidth: panel.getBoundingClientRect().width };
             if (side === "left") suppressWidthAnchor = true;
         });
         panel.appendChild(h);
@@ -630,13 +673,78 @@ function createPanel() {
         if (!edgeDrag) return;
         const delta = e.clientX - edgeDrag.startX;
         const newWidth = edgeDrag.side === "left" ? edgeDrag.startWidth - delta : edgeDrag.startWidth + delta;
-        panel.style.width = Math.max(200, Math.min(window.innerWidth, newWidth)) + "px";
+        panel.style.width = Math.max(200, Math.min(window.innerWidth, newWidth)) / panelScale + "px";
     });
     document.addEventListener("mouseup", () => {
         if (edgeDrag) {
             edgeDrag = null;
             suppressWidthAnchor = false;
         }
+    });
+
+    const scaleMenu = document.createElement("div");
+    scaleMenu.style.cssText = `
+        display:none; position:fixed; z-index:52;
+        background:${C.headerBg}; color:${C.text};
+        border:1px solid ${C.border}; border-radius:4px;
+        padding:2px 0; min-width:120px;
+        box-shadow:0 4px 12px rgba(0,0,0,0.7);
+        font-family:monospace; font-size:10px;
+    `;
+    const scaleLabel = document.createElement("div");
+    scaleLabel.textContent = "Scale";
+    scaleLabel.style.cssText = `padding:3px 10px;color:${C.textDim};font-size:9px;text-transform:uppercase;`;
+    scaleMenu.appendChild(scaleLabel);
+
+    const scalePresets = [0.75, 1, 1.25, 1.5, 1.75, 2];
+    const scaleItems = new Map();
+    function renderScaleItems() {
+        for (const [s, item] of scaleItems) {
+            item.textContent = `${Math.abs(s - panelScale) < 1e-6 ? "✓ " : "  "}${Math.round(s * 100)}%`;
+        }
+    }
+    function setScale(s) {
+        const w = panel.getBoundingClientRect().width;
+        panelScale = s;
+        panel._scale = s;
+        panel.style.zoom = s;
+        // preserve visual width across scale change
+        panel.style.width = (w / s) + "px";
+        applyConstraints();
+        applyOffsets();
+        saveState({ scale: s });
+    }
+    for (const s of scalePresets) {
+        const item = document.createElement("div");
+        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+        item.addEventListener("mouseenter", () => item.style.background = C.btn);
+        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.addEventListener("click", (e) => {
+            e.stopPropagation();
+            setScale(s);
+            renderScaleItems();
+            scaleMenu.style.display = "none";
+        });
+        scaleMenu.appendChild(item);
+        scaleItems.set(s, item);
+    }
+    renderScaleItems();
+    document.body.appendChild(scaleMenu);
+
+    panel.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        renderScaleItems();
+        scaleMenu.style.zoom = panelScale;
+        scaleMenu.style.display = "block";
+        const mRect = scaleMenu.getBoundingClientRect();
+        const mw = mRect.width || 120 * panelScale;
+        const mh = mRect.height || 160 * panelScale;
+        scaleMenu.style.left = (Math.min(e.clientX, window.innerWidth - mw - 4) / panelScale) + "px";
+        scaleMenu.style.top = (Math.min(e.clientY, window.innerHeight - mh - 4) / panelScale) + "px";
+    });
+    document.addEventListener("click", (e) => {
+        if (!scaleMenu.contains(e.target)) scaleMenu.style.display = "none";
     });
 
     document.body.appendChild(panel);
@@ -647,7 +755,7 @@ function createPanel() {
     let lastPanelWidth = null;
     if (typeof ResizeObserver !== "undefined") {
         new ResizeObserver(() => {
-            const w = panel.offsetWidth;
+            const w = panel.getBoundingClientRect().width;
             if (lastPanelWidth !== null && w !== lastPanelWidth) {
                 if (!suppressWidthAnchor) rightOffset -= (w - lastPanelWidth);
                 saveState({ width: w, rightOffset, bottomOffset });
@@ -875,7 +983,7 @@ function renderData(body, data) {
     }
 
     const r = ensureStructure(body);
-    const pw = body._panel.offsetWidth;
+    const pw = body._panel.getBoundingClientRect().width;
     body._titleSpan.textContent =
         pw >= 320 && data.aimdo_active ? "Memory (aimdo)" :
         pw >= 240 ? "Memory" : "";
@@ -940,8 +1048,11 @@ function renderData(body, data) {
         const tempStr = data.gpu_temp != null
             ? ` <span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}&deg;C</span>`
             : "";
+        const powerStr = data.gpu_power != null && data.gpu_power_limit != null
+            ? ` <span style="color:${gpuPowerColor(data.gpu_power, data.gpu_power_limit)};">${formatPower(data.gpu_power, data.gpu_power_limit)}</span>`
+            : "";
         mb.querySelector(".mini-gpu-usage").innerHTML =
-            `<span style="color:${gpuColor};">${pctStr}</span>${tempStr}`;
+            `<span style="color:${gpuColor};">${pctStr}</span>${tempStr}${powerStr}`;
         gpuBar.innerHTML = `<div style="background:${gpuColor};height:100%;width:${data.gpu_util}%;"></div>`;
     } else {
         gpuRow.style.display = "none";
@@ -986,14 +1097,26 @@ function renderData(body, data) {
             <span>cache: ${formatBytes(data.torch_reserved - data.torch_active)}</span>
             ${data.gpu_util != null ? `<span class="aimdo-gpu-util" title="Click to toggle GPU line on graph" style="color:${gpuUtilColor(data.gpu_util)};cursor:pointer;opacity:${gpuLineVisible ? 1 : 0.4};">GPU ${data.gpu_util < 10 ? "0" : ""}${data.gpu_util}%</span>` : ""}
             ${data.gpu_temp != null ? `<span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}&deg;C</span>` : ""}
+            ${data.gpu_power != null && data.gpu_power_limit != null ? `<span title="GPU power draw / cap" style="color:${gpuPowerColor(data.gpu_power, data.gpu_power_limit)};">${formatPower(data.gpu_power, data.gpu_power_limit)}</span>` : ""}
             ${execState.running ? `<span style="color:${C.running};">&#9679; ${execState.node || "running"}${execState.progress ? " " + execState.progress : ""}</span>` : `<span>&#9679; idle</span>`}
         </div>
     </div>`;
 
-    // sync canvas resolution to display size
-    const displayW = r.graphCanvas.clientWidth || 300;
-    if (r.graphCanvas.width !== displayW) r.graphCanvas.width = displayW;
-    drawGraph(r.graphCtx, r.graphCanvas.width, r.graphCanvas.height);
+    // sync canvas backing to device pixels: visual viewport px × devicePixelRatio.
+    // Drawing then happens in logical (panel-local) CSS px via the totalScale transform,
+    // so cells/lines scale with panelScale while staying crisp on HiDPI.
+    const panelScaleNow = body._panel._scale || 1;
+    const dpr = window.devicePixelRatio || 1;
+    const totalScale = panelScaleNow * dpr;
+    const gRect = r.graphCanvas.getBoundingClientRect();
+    if (gRect.width > 0 && gRect.height > 0) {
+        const backingW = Math.max(1, Math.round(gRect.width * dpr));
+        const backingH = Math.max(1, Math.round(gRect.height * dpr));
+        if (r.graphCanvas.width !== backingW) r.graphCanvas.width = backingW;
+        if (r.graphCanvas.height !== backingH) r.graphCanvas.height = backingH;
+        r.graphCtx.setTransform(totalScale, 0, 0, totalScale, 0, 0);
+        drawGraph(r.graphCtx, gRect.width / panelScaleNow, gRect.height / panelScaleNow);
+    }
 
     // models section — incremental DOM updates: keep rows across polls, only mutate text/widths
     if (data.models.length === 0 && !r.noModelsMsg) {
@@ -1074,8 +1197,11 @@ function renderData(body, data) {
                 r.pageCtxs[vkey] = canvas.getContext("2d");
             }
             if (canvas.parentElement !== ref.pgrid) ref.pgrid.appendChild(canvas);
-            canvas.width = ref.pgrid.clientWidth || r.modelsDiv.clientWidth || 300;
-            drawPageGrid(r.pageCtxs[vkey], canvas.width, vb.residency, st ? st.changeAge : new Uint8Array(vb.residency.length));
+            const pgVisualW = ref.pgrid.getBoundingClientRect().width
+                || r.modelsDiv.getBoundingClientRect().width
+                || 300 * panelScaleNow;
+            const pgCssW = pgVisualW / panelScaleNow;
+            drawPageGrid(r.pageCtxs[vkey], pgCssW, vb.residency, st ? st.changeAge : new Uint8Array(vb.residency.length), panelScaleNow);
         }
     }
 
