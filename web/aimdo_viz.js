@@ -1154,7 +1154,7 @@ function renderData(body, data) {
             `<span><span style="color:${C.pinned};">&#9632;</span> pinned</span>` +
             `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded</span>` +
             `<span><span style="color:${C.torch};">&#9632;</span> torch</span>` +
-            `<span><span style="color:${C.totalLine};">&#9472;</span> total used</span>` +
+            `<span><span style="color:${C.totalLine};">&#9472;</span> total</span>` +
             `<span><span style="color:${C.gpuUtil};">&#9472;</span> GPU %</span>`;
         r.modelsDiv.insertBefore(r.bottomLegend, r.modelsDiv.firstChild);
     }
