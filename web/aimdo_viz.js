@@ -379,34 +379,28 @@ function createPanel() {
         return bottom;
     }
 
-    // left-axis mirror of getTopChromeBottom for the side toolbar.
-    function getLeftChromeRight(panelTop, panelBottom) {
-        const leafSels = [".side-toolbar-container"];
-        let right = 0;
-        if (panelTop == null) {
-            for (const s of leafSels) {
-                for (const el of document.querySelectorAll(s)) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 0 && r.right > right) right = r.right;
-                }
-            }
-            return right;
-        }
-        for (const s of leafSels) {
-            for (const el of document.querySelectorAll(s)) {
-                const r = el.getBoundingClientRect();
-                if (r.width <= 0) continue;
-                if (r.bottom <= panelTop || r.top >= panelBottom) continue;
-                for (const node of el.querySelectorAll("*")) {
-                    if (node.children.length > 0) continue;
-                    const nr = node.getBoundingClientRect();
-                    if (nr.width <= 0 || nr.height <= 0) continue;
-                    if (nr.bottom <= panelTop || nr.top >= panelBottom) continue;
-                    if (nr.right > right) right = nr.right;
-                }
+    // horizontal constraints from the side toolbar(s). ComfyUI lets the user dock
+    // .side-toolbar-container on either edge; classify each instance by which edge
+    // it hugs and produce minLeft / maxRight in one pass. Side toolbars are opaque
+    // bars (unlike .actionbar-container's transparent gutter), so clamp to the
+    // container's edge rather than walking into leaf icons — otherwise the panel
+    // slips under the bar's internal padding.
+    function isLeftAnchored(r) { return r.left < 8; }
+    function isRightAnchored(r) { return window.innerWidth - r.right < 8; }
+    function getSideChromeBounds(panelTop, panelBottom) {
+        let minLeft = 0;
+        let maxRight = window.innerWidth;
+        for (const el of document.querySelectorAll(".side-toolbar-container")) {
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0) continue;
+            if (panelTop != null && (r.bottom <= panelTop || r.top >= panelBottom)) continue;
+            if (isLeftAnchored(r)) {
+                if (r.right > minLeft) minLeft = r.right;
+            } else if (isRightAnchored(r)) {
+                if (r.left < maxRight) maxRight = r.left;
             }
         }
-        return right;
+        return { minLeft, maxRight };
     }
 
     function clampOffsets(ro, bo) {
@@ -419,7 +413,7 @@ function createPanel() {
         const panelTop = b.bottom - bo - h;
         const panelBottom = b.bottom - bo;
         const minTop = getTopChromeBottom(panelLeft, panelRight);
-        const minLeft = getLeftChromeRight(panelTop, panelBottom);
+        const { minLeft, maxRight } = getSideChromeBounds(panelTop, panelBottom);
 
         // when window's too short for both constraints, prefer the chrome
         // clamp over the viewport edge so we never overlap the topbar/sidebar.
@@ -427,8 +421,10 @@ function createPanel() {
         const boLo = b.bottom - vh;
         const boClamped = boHi < boLo ? boHi : Math.max(boLo, Math.min(bo, boHi));
 
+        // roLo is the larger of: keep panel right within viewport, keep panel right
+        // left of right-docked chrome. Either way, ro must be >= the constraint.
         const roHi = b.right - w - minLeft;
-        const roLo = b.right - vw;
+        const roLo = Math.max(b.right - vw, b.right - maxRight);
         const roClamped = roHi < roLo ? roHi : Math.max(roLo, Math.min(ro, roHi));
         return { ro: roClamped, bo: boClamped, b, w, h };
     }
