@@ -304,7 +304,7 @@ function createPanel() {
         padding: 0; font-family: monospace; font-size: 12px;
         z-index: 50; min-width: 200px; width: 340px; max-width: 100vw; max-height: 90vh;
         box-shadow: 0 4px 12px rgba(0,0,0,0.7);
-        user-select: none; resize: horizontal; overflow-y: auto;
+        user-select: none; overflow-y: auto;
     `;
     panel.style.zoom = panelScale;
     panel._scale = panelScale;
@@ -657,7 +657,13 @@ function createPanel() {
             if (e.button !== 0) return;
             e.preventDefault();
             e.stopPropagation();
-            edgeDrag = { side, startX: e.clientX, startWidth: panel.getBoundingClientRect().width };
+            // anchor stays put; the other edge must respect the side-chrome bound
+            // on its travel direction. Compute maxWidth once at drag start so the
+            // ResizeObserver-driven ro shift during the drag can't shift the cap.
+            const r = panel.getBoundingClientRect();
+            const { minLeft, maxRight } = getSideChromeBounds(r.top, r.bottom);
+            const maxWidth = side === "right" ? maxRight - r.left : r.right - minLeft;
+            edgeDrag = { side, startX: e.clientX, startWidth: r.width, maxWidth };
             if (side === "left") suppressWidthAnchor = true;
         });
         panel.appendChild(h);
@@ -669,7 +675,7 @@ function createPanel() {
         if (!edgeDrag) return;
         const delta = e.clientX - edgeDrag.startX;
         const newWidth = edgeDrag.side === "left" ? edgeDrag.startWidth - delta : edgeDrag.startWidth + delta;
-        panel.style.width = Math.max(200, Math.min(window.innerWidth, newWidth)) / panelScale + "px";
+        panel.style.width = Math.max(200, Math.min(edgeDrag.maxWidth, newWidth)) / panelScale + "px";
     });
     document.addEventListener("mouseup", () => {
         if (edgeDrag) {
