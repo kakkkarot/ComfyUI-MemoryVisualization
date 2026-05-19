@@ -26,6 +26,7 @@ const C = {
     vram:       "#e67e22",
     torch:      "#2ecc71",
     pinned:     "#4a9eff",
+    loadedRam:  "#0b3d66",
     unloaded:   "#3a3a3a",
     torchCache: "#1a7a3a",
     python:     "#9b59b6",
@@ -911,10 +912,11 @@ function renderModelRow(r, m, data) {
         row.wmBtn = null;
     }
 
-    if (row.lastDynamic !== m.dynamic) {
+    const barColors = m.dynamic ? [C.vram, C.pinned, C.loadedRam, C.unloaded] : [C.vram, C.pinned, C.loadedRam, C.pinned];
+    if (row.lastDynamic !== m.dynamic || row.barSegs.length !== barColors.length) {
         row.bar.innerHTML = "";
         row.barSegs = [];
-        for (const color of (m.dynamic ? [C.vram, C.pinned, C.unloaded] : [C.vram, C.pinned])) {
+        for (const color of barColors) {
             const seg = document.createElement("div");
             seg.style.cssText = `background:${color};height:100%;`;
             row.bar.appendChild(seg);
@@ -925,28 +927,41 @@ function renderModelRow(r, m, data) {
 
     if (m.dynamic) {
         const pinnedRam = m.pinned_ram || 0;
-        const unloadedSize = Math.max(0, m.total_size - m.vbar_loaded - pinnedRam);
+        const loadedRam = m.loaded_ram || 0;
+        const unloadedSize = Math.max(0, m.total_size - m.vbar_loaded - pinnedRam - loadedRam);
         const total = m.total_size || 1;
         row.barSegs[0].style.width = (m.vbar_loaded / total * 100) + "%";
         row.barSegs[0].title = "VRAM: " + formatBytes(m.vbar_loaded);
         row.barSegs[1].style.width = (pinnedRam / total * 100) + "%";
         row.barSegs[1].title = "pinned RAM: " + formatBytes(pinnedRam);
-        row.barSegs[2].style.width = (unloadedSize / total * 100) + "%";
-        row.barSegs[2].title = "unloaded: " + formatBytes(unloadedSize);
+        row.barSegs[2].style.width = (loadedRam / total * 100) + "%";
+        row.barSegs[2].title = "loaded RAM: " + formatBytes(loadedRam);
+        row.barSegs[3].style.width = (unloadedSize / total * 100) + "%";
+        row.barSegs[3].title = "unloaded: " + formatBytes(unloadedSize);
         row.legend.innerHTML =
             `<span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.vbar_loaded)}</span>` +
             (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
+            (loadedRam > 0 ? `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
             `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded ${formatBytes(unloadedSize)}</span>`;
     } else {
         const inRam = Math.max(0, m.total_size - m.loaded_size);
+        const pinnedRam = m.pinned_ram || 0;
+        const loadedRam = m.loaded_ram || 0;
+        const otherRam = Math.max(0, inRam - pinnedRam - loadedRam);
         const total = m.total_size || 1;
         row.barSegs[0].style.width = (m.loaded_size / total * 100) + "%";
         row.barSegs[0].title = "VRAM: " + formatBytes(m.loaded_size);
-        row.barSegs[1].style.width = (inRam / total * 100) + "%";
-        row.barSegs[1].title = "RAM: " + formatBytes(inRam);
+        row.barSegs[1].style.width = (pinnedRam / total * 100) + "%";
+        row.barSegs[1].title = "pinned RAM: " + formatBytes(pinnedRam);
+        row.barSegs[2].style.width = (loadedRam / total * 100) + "%";
+        row.barSegs[2].title = "loaded RAM: " + formatBytes(loadedRam);
+        row.barSegs[3].style.width = (otherRam / total * 100) + "%";
+        row.barSegs[3].title = "RAM: " + formatBytes(otherRam);
         row.legend.innerHTML =
             `<span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.loaded_size)}</span>` +
-            (inRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> RAM ${formatBytes(inRam)}</span>` : "");
+            (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
+            (loadedRam > 0 ? `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
+            (otherRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> RAM ${formatBytes(otherRam)}</span>` : "");
     }
 
     // vbars: rebuild structure only when device list / count changes
@@ -1021,9 +1036,11 @@ function renderData(body, data) {
     const ramTotal = data.total_ram || 1;
     const processRam = data.process_ram || 0;
     const pinnedRamTotal = data.pinned_ram || 0;
-    const pythonOther = Math.max(0, processRam - pinnedRamTotal);
+    const loadedRamTotal = data.loaded_ram || 0;
+    const pythonOther = Math.max(0, processRam - pinnedRamTotal - loadedRamTotal);
     const ramOther = Math.max(0, ramUsed - processRam);
     const pinnedRamPct = (pinnedRamTotal / ramTotal * 100).toFixed(0);
+    const loadedRamPct = (loadedRamTotal / ramTotal * 100).toFixed(0);
     const pythonOtherPct = (pythonOther / ramTotal * 100).toFixed(0);
     const ramOtherPct = (ramOther / ramTotal * 100).toFixed(0);
 
@@ -1037,6 +1054,7 @@ function renderData(body, data) {
     mb.querySelector(".mini-ram-usage").textContent = `${formatBytes(ramUsed)} / ${formatBytes(ramTotal)}`;
     mb.querySelector(".mini-ram-bar").innerHTML =
         `<div style="background:${C.pinned};height:100%;width:${pinnedRamPct}%;"></div>` +
+        `<div style="background:${C.loadedRam};height:100%;width:${loadedRamPct}%;"></div>` +
         `<div style="background:${C.python};height:100%;width:${pythonOtherPct}%;"></div>` +
         `<div style="background:${C.other};height:100%;width:${ramOtherPct}%;"></div>`;
 
@@ -1068,11 +1086,13 @@ function renderData(body, data) {
         </div>
         <div style="background:${C.barBg};border-radius:3px;height:8px;overflow:hidden;display:flex;">
             <div style="background:${C.pinned};height:100%;width:${pinnedRamPct}%;" title="pinned: ${formatBytes(pinnedRamTotal)}"></div>
+            <div style="background:${C.loadedRam};height:100%;width:${loadedRamPct}%;" title="loaded: ${formatBytes(loadedRamTotal)}"></div>
             <div style="background:${C.python};height:100%;width:${pythonOtherPct}%;" title="python: ${formatBytes(pythonOther)}"></div>
             <div style="background:${C.other};height:100%;width:${ramOtherPct}%;" title="other: ${formatBytes(ramOther)}"></div>
         </div>
         <div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
             <span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRamTotal)}</span>
+            <span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRamTotal)}</span>
             <span><span style="color:${C.python};">&#9632;</span> python ${formatBytes(pythonOther)}</span>
             <span><span style="color:${C.other};">&#9632;</span> other ${formatBytes(ramOther)}</span>
         </div>
@@ -1154,6 +1174,7 @@ function renderData(body, data) {
         r.bottomLegend.innerHTML =
             `<span><span style="color:${C.vram};">&#9632;</span> VRAM</span>` +
             `<span><span style="color:${C.pinned};">&#9632;</span> pinned</span>` +
+            `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded</span>` +
             `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded</span>` +
             `<span><span style="color:${C.torch};">&#9632;</span> torch</span>` +
             `<span><span style="color:${C.totalLine};">&#9472;</span> total</span>` +

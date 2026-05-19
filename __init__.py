@@ -81,13 +81,20 @@ async def aimdo_vram_status(request):
         total_size = patcher.model_size()
         loaded = patcher.loaded_size()
 
-        # RAM side: pinned host memory used for fast transfers
+        # RAM side: pinned host memory used for fast transfers, plus
+        # non-pinned loaded host memory when the patcher exposes it.
         pinned_ram = 0
         try:
             if hasattr(patcher, 'pinned_memory_size'):
                 pinned_ram = patcher.pinned_memory_size()
         except Exception as e:
             log.debug("aimdo-viz: pinned_memory_size failed: %s", e)
+        loaded_ram = 0
+        try:
+            if hasattr(patcher, 'loaded_ram_size'):
+                loaded_ram = max(0, patcher.loaded_ram_size() - pinned_ram)
+        except Exception as e:
+            log.debug("aimdo-viz: loaded_ram_size failed: %s", e)
 
         # VBAR state per device (aimdo only)
         vbars = []
@@ -122,6 +129,7 @@ async def aimdo_vram_status(request):
             "vbar_loaded": vbar_loaded_total,
             "ram_size": max(0, total_size - vbar_loaded_total),
             "pinned_ram": pinned_ram,
+            "loaded_ram": loaded_ram,
             "dynamic": is_dynamic,
             "vbars": vbars,
         }
@@ -158,6 +166,7 @@ async def aimdo_vram_status(request):
     ram = psutil.virtual_memory()
     process_ram = psutil.Process().memory_info().rss
     total_pinned = sum(m.get("pinned_ram", 0) for m in models)
+    total_loaded_ram = sum(m.get("loaded_ram", 0) for m in models)
 
     return web.json_response({
         "enabled": True,
@@ -175,6 +184,7 @@ async def aimdo_vram_status(request):
         "used_ram": ram.used,
         "process_ram": process_ram,
         "pinned_ram": total_pinned,
+        "loaded_ram": total_loaded_ram,
         "models": models,
     })
 
