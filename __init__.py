@@ -9,7 +9,7 @@ from aiohttp import web
 import psutil
 import comfy.model_management
 import comfy.memory_management
-
+import comfy.model_base
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +55,64 @@ def _get_lock():
     if not hasattr(mm, '_viz_model_lock'):
         mm._viz_model_lock = asyncio.Lock()
     return mm._viz_model_lock
+
+# cached; CPU model doesn't change at runtime.
+_cpu_name_cache = {"tried": False, "name": None}
+def _get_cpu_name():
+    if _cpu_name_cache["tried"]:
+        return _cpu_name_cache["name"]
+    _cpu_name_cache["tried"] = True
+    try:
+        import platform
+        sys_name = platform.system()
+        if sys_name == "Windows":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+                _cpu_name_cache["name"] = name.strip()
+        elif sys_name == "Darwin":
+            import subprocess
+            _cpu_name_cache["name"] = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], timeout=2
+            ).decode().strip()
+        elif sys_name == "Linux":
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if "model name" in line:
+                        _cpu_name_cache["name"] = line.split(":", 1)[1].strip()
+                        break
+    except Exception as e:
+        log.debug("aimdo-viz: cpu name lookup failed: %s", e)
+    return _cpu_name_cache["name"]
+
+def _detect_model_type(model_obj):
+    """Classify a loaded model into a ComfyUI slot type so the UI can color it
+    consistently with node connection colors. Returns None when nothing matches
+    so the UI falls back to the default text color rather than mislabeling."""
+    try:
+        if isinstance(model_obj, comfy.model_base.BaseModel):
+            return "model"
+    except Exception:
+        pass
+    cls = model_obj.__class__
+    name = cls.__name__.lower()
+    module = (cls.__module__ or "").lower()
+    # order matters: clip_vision before clip, style_model before model substring matches.
+    if "clipvision" in name or "clip_vision" in name or "clip_vision" in module:
+        return "clip_vision"
+    if "controlnet" in name or "t2iadapter" in name or "controlnet" in module:
+        return "controlnet"
+    if "stylemodel" in name or "style_model" in name:
+        return "style_model"
+    if "gligen" in name:
+        return "gligen"
+    if "vae" in name or "autoencod" in name or module.endswith(".vae"):
+        return "vae"
+    if "clip" in name or "t5" in name or "textencoder" in name or "text_encoders" in module:
+        return "clip"
+    if "esrgan" in name or "upscal" in name or "rrdb" in name or "spandrel" in module:
+        return "upscale_model"
+    return None
 routes = server.PromptServer.instance.routes
 
 @routes.get("/aimdo/vram")
@@ -117,6 +175,7 @@ async def aimdo_vram_status(request):
         entry = {
             "index": model_idx,
             "name": name,
+            "type": _detect_model_type(model_obj),
             "total_size": total_size,
             "loaded_size": loaded,
             "vbar_loaded": vbar_loaded_total,
@@ -150,6 +209,17 @@ async def aimdo_vram_status(request):
         gpu_power = None
     gpu_power_limit = _nvml_power_limit(device)  # mW
 
+    try:
+        gpu_name = torch.cuda.get_device_name(device)
+    except Exception:
+        gpu_name = None
+
+    # non-blocking; first call after process start returns 0, subsequent calls are real
+    try:
+        cpu_util = psutil.cpu_percent(interval=None)
+    except Exception:
+        cpu_util = None
+
     # pytorch internal stats
     stats = torch.cuda.memory_stats(device)
     torch_active = stats.get('active_bytes.all.current', 0)
@@ -168,6 +238,9 @@ async def aimdo_vram_status(request):
         "gpu_temp": gpu_temp,
         "gpu_power": gpu_power,
         "gpu_power_limit": gpu_power_limit,
+        "gpu_name": gpu_name,
+        "cpu_util": cpu_util,
+        "cpu_name": _get_cpu_name(),
         "aimdo_usage": aimdo_usage,
         "torch_active": torch_active,
         "torch_reserved": torch_reserved,
