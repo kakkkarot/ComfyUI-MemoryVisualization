@@ -336,18 +336,18 @@ function drawGraph(ctx, w, h) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // execution start/end markers — vertical dashed lines positioned by timestamp.
-    // Start: torch green (workflow active), end: dim gray (idle).
+    // exec start/end markers — full-canvas time axis so partial-data fills don't bunch events at the right edge.
     if (history.execEvents.length) {
-        const tStart = historyGet(history.times, startIdx);
-        const tEnd = historyGet(history.times, startIdx + visible - 1);
-        const tRange = tEnd - tStart;
-        if (tRange > 0) {
+        const newest = historyGet(history.times, startIdx + visible - 1);
+        const oldestVisible = historyGet(history.times, startIdx);
+        const timePerStep = visible >= 2 ? (newest - oldestVisible) / (visible - 1) : HISTORY_TICK_MS;
+        const rightEdgeX = (GRAPH_POINTS - 1) * stepX;
+        if (timePerStep > 0) {
             ctx.lineWidth = 1;
             ctx.setLineDash([2, 3]);
             for (const evt of history.execEvents) {
-                if (evt.time < tStart || evt.time > tEnd) continue;
-                const x = dataStartX + ((evt.time - tStart) / tRange) * (visible - 1) * stepX;
+                const x = rightEdgeX - ((newest - evt.time) / timePerStep) * stepX;
+                if (x < 0 || x > rightEdgeX + 0.5) continue;
                 ctx.strokeStyle = evt.type === "start" ? C.torch : C.gpuUtilHi;
                 ctx.beginPath();
                 ctx.moveTo(x + 0.5, 0);
