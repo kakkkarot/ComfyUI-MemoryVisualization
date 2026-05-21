@@ -1,14 +1,28 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { THEMES } from "./themes.js";
 
 let pollInterval = 500;
 const FADE_TICKS = 6;
-const GRAPH_POINTS = 120;
+const GRAPH_POINTS = 120;        // visible window size (data points drawn on the canvas at once)
+const HISTORY_BUFFER = 1200;     // total points retained for scrollback (~20 min at 1s history tick)
+const HISTORY_TICK_MS = 1000;    // history snapshots fire at most this often regardless of poll rate
 
 const execState = { running: false, node: null, progress: null };
 let peakVramUsed = 0;
 let gpuLineVisible = true;
 let modelCollapsed = {};
+let colorModelBars = false;
+let colorModelStroke = true;
+let colorModelName = true;
+let showLegends = true;
+let showRamInMini = true;
+let showVramInMini = true;
+let showGpuInMini = true;
+let showCpuInMini = true;
+let showHwNames = true;
+let graphHeight = 80;
+let currentTheme = "default";
 
 const STORAGE_KEY = "aimdo_viz_state";
 function loadState() {
@@ -21,36 +35,42 @@ function saveState(patch) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
 }
 
-// color palette — dark chrome, colored data
-const C = {
-    vram:       "#e67e22",
-    torch:      "#2ecc71",
-    pinned:     "#4a9eff",
-    loadedRam:  "#0b3d66",
-    unloaded:   "#3a3a3a",
-    torchCache: "#1a7a3a",
-    python:     "#9b59b6",
-    other:      "#505050",
-    text:       "#b0b0b0",
-    textDim:    "#707070",
-    running:    "#b0b0b0",
-    bg:         "#181818",
-    headerBg:   "#202020",
-    border:     "#2a2a2a",
-    btn:        "#2a2a2a",
-    btnText:    "#888",
-    graphBg:    "#0e0e0e",
-    gridLine:   "#1e1e1e",
-    totalLine:  "#d0d0d0",
-    gpuUtil:    "#f1c40f",
-    gpuUtilHi:  "#e74c3c",
-    capLine:    "#555",
-    barBg:      "#222",
-    fadeInFrom:  [255, 220, 0],
-    fadeInTo:    [230, 126, 34],
-    fadeOutFrom: [200, 60, 60],
-    fadeOutTo:   [58, 58, 58],
-};
+// live palette + model-type colors; mutated by applyPalette on theme switches.
+// THEMES.default is the source of truth — see themes.js.
+const C = { ...THEMES.default.palette };
+const MODEL_TYPE_COLOR = { ...THEMES.default.modelTypes };
+
+// frozen baseline so applyPalette can reset cleanly before merging overrides.
+const DEFAULT_C = Object.freeze({ ...THEMES.default.palette });
+const DEFAULT_TYPES = Object.freeze({ ...THEMES.default.modelTypes });
+
+// palette-only swap (no DOM); called at init before elements exist.
+function applyPalette(name) {
+    Object.assign(C, DEFAULT_C);
+    Object.assign(MODEL_TYPE_COLOR, DEFAULT_TYPES);
+    const t = THEMES[name];
+    if (t) {
+        Object.assign(C, t.palette || {});
+        Object.assign(MODEL_TYPE_COLOR, t.modelTypes || {});
+    }
+}
+
+function hexToRgb(hex) {
+    const h = hex.replace("#", "");
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+function hexToRgba(hex, alpha) {
+    const [r, g, b] = hexToRgb(hex);
+    return `rgba(${r},${g},${b},${alpha})`;
+}
+// blend [r,g,b] toward white. Used so fade-in stays in the type's hue family.
+function lightenRgb([r, g, b], amount) {
+    return [
+        Math.round(r + (255 - r) * amount),
+        Math.round(g + (255 - g) * amount),
+        Math.round(b + (255 - b) * amount),
+    ];
+}
 
 
 function escHtml(s) {
@@ -82,23 +102,65 @@ function formatPower(draw_mW, limit_mW) {
     return `${draw}/${Math.round(limit_mW / 1000)}W`;
 }
 
-function formatBytes(bytes) {
-    if (bytes == null) return "?";
-    if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
-    if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + " MB";
-    return (bytes / 1024).toFixed(0) + " KB";
+function formatClock(ms) {
+    const d = new Date(ms);
+    const pad = n => n.toString().padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// rolling history — ring buffer to avoid shift()
+function shortenGpuName(name) {
+    return name.replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "").replace(/\s+Laptop GPU$/i, "");
+}
+
+function shortenCpuName(name) {
+    return name
+        .replace(/\(R\)|\(TM\)|\(tm\)/gi, "")
+        .replace(/\s+CPU\s+@.*$/i, "")           // "i9-12900K CPU @ 3.20GHz" → "i9-12900K"
+        .replace(/\s+\d+-Core\s+Processor$/i, "")// "Ryzen 9 7950X 16-Core Processor" → "Ryzen 9 7950X"
+        .replace(/^Intel\s+Core\s+/i, "")
+        .replace(/^AMD\s+/i, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function formatBytes(bytes) {
+    if (bytes == null) return "?";
+    // non-breaking space ( ) so "8.4 GB" never line-wraps between value and unit.
+    if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
+    if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + " MB";
+    return (bytes / 1024).toFixed(0) + " KB";
+}
+
+// rolling history — ring buffer for ~20 min of data at 1s history tick; the visible window of
+// GRAPH_POINTS slides along this buffer based on viewOffset (0 = following live).
 const history = {
-    torch_active: new Float64Array(GRAPH_POINTS),
-    aimdo_usage: new Float64Array(GRAPH_POINTS),
-    free_vram: new Float64Array(GRAPH_POINTS),
-    gpu_util: new Float64Array(GRAPH_POINTS),
+    torch_active: new Float64Array(HISTORY_BUFFER),
+    aimdo_usage: new Float64Array(HISTORY_BUFFER),
+    free_vram: new Float64Array(HISTORY_BUFFER),
+    gpu_util: new Float64Array(HISTORY_BUFFER),
+    times: new Float64Array(HISTORY_BUFFER),    // ms timestamps; absolute so pollInterval changes don't distort
     total_vram: 1,
     head: 0,
     len: 0,
+    viewOffset: 0,      // points back from newest; 0 = right edge (live)
+    followLive: true,
+    execEvents: [],     // {type: "start"|"end", time: ms} — drawn as vertical marks
 };
+const EXEC_EVENTS_MAX = 200;
+const EXEC_NOOP_MS = 1500;  // start→end shorter than this is treated as a queue-with-no-changes; both events dropped
+function pushExecEvent(type) {
+    if (type === "end" && history.execEvents.length > 0) {
+        const last = history.execEvents[history.execEvents.length - 1];
+        if (last.type === "start" && Date.now() - last.time < EXEC_NOOP_MS) {
+            history.execEvents.pop();
+            return;
+        }
+    }
+    history.execEvents.push({ type, time: Date.now() });
+    if (history.execEvents.length > EXEC_EVENTS_MAX) {
+        history.execEvents.splice(0, history.execEvents.length - EXEC_EVENTS_MAX);
+    }
+}
 
 // NVML util frequently dips to 0 mid-workload; peak-hold preserves real peaks.
 const GPU_SMOOTH_WINDOW = 3;
@@ -128,19 +190,87 @@ function pushHistory(data) {
     }
     history.free_vram[i] = data.free_vram;
     history.gpu_util[i] = data.gpu_util != null ? data.gpu_util : 0;
-    history.head = (i + 1) % GRAPH_POINTS;
-    if (history.len < GRAPH_POINTS) history.len++;
+    history.times[i] = Date.now();
+    history.head = (i + 1) % HISTORY_BUFFER;
+    if (history.len < HISTORY_BUFFER) history.len++;
+    // when scrolled back, advance viewOffset so the user's pinned window keeps
+    // showing the same chronological data instead of sliding with new points.
+    if (!history.followLive) {
+        const maxOffset = Math.max(0, history.len - GRAPH_POINTS);
+        history.viewOffset = Math.min(maxOffset, history.viewOffset + 1);
+    }
 }
 
 function historyGet(arr, idx) {
-    // idx 0 = oldest, idx len-1 = newest
-    return arr[(history.head - history.len + idx + GRAPH_POINTS) % GRAPH_POINTS];
+    // idx 0 = oldest valid, idx len-1 = newest
+    return arr[(history.head - history.len + idx + HISTORY_BUFFER) % HISTORY_BUFFER];
 }
+
+// history persistence — separate localStorage key from the panel settings since
+// it's larger and changes constantly. ~50 KB at full buffer.
+const HISTORY_STORAGE_KEY = "aimdo_viz_history";
+function saveHistory() {
+    try {
+        const len = history.len;
+        if (len === 0) { localStorage.removeItem(HISTORY_STORAGE_KEY); return; }
+        // serialize in chronological order so the ring's head/wrap is irrelevant on load
+        const ordered = arr => {
+            const out = new Array(len);
+            for (let i = 0; i < len; i++) {
+                out[i] = arr[(history.head - len + i + HISTORY_BUFFER) % HISTORY_BUFFER];
+            }
+            return out;
+        };
+        localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify({
+            v: 1,
+            len,
+            total_vram: history.total_vram,
+            times: ordered(history.times),
+            torch_active: ordered(history.torch_active),
+            aimdo_usage: ordered(history.aimdo_usage),
+            free_vram: ordered(history.free_vram),
+            gpu_util: ordered(history.gpu_util),
+            execEvents: history.execEvents,
+        }));
+    } catch {
+        // quota or other failure — silently skip; next save attempt may succeed
+    }
+}
+function loadHistory() {
+    try {
+        const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (!data || data.v !== 1 || typeof data.len !== "number") return;
+        const len = Math.min(data.len, HISTORY_BUFFER);
+        history.total_vram = data.total_vram || 1;
+        for (let i = 0; i < len; i++) {
+            history.times[i] = data.times[i];
+            history.torch_active[i] = data.torch_active[i];
+            history.aimdo_usage[i] = data.aimdo_usage[i];
+            history.free_vram[i] = data.free_vram[i];
+            history.gpu_util[i] = data.gpu_util[i];
+        }
+        history.len = len;
+        history.head = len % HISTORY_BUFFER;
+        if (Array.isArray(data.execEvents)) history.execEvents = data.execEvents.slice(-EXEC_EVENTS_MAX);
+    } catch {
+        // corrupted blob — leave history empty
+    }
+}
+loadHistory();
+setInterval(saveHistory, 10000);
+window.addEventListener("beforeunload", saveHistory);
 
 function drawGraph(ctx, w, h) {
     const total = history.total_vram;
     const len = history.len;
     if (len < 2) return;
+
+    // windowed slice: render `visible` points starting at chronological index `startIdx`.
+    const visible = Math.min(GRAPH_POINTS, len - history.viewOffset);
+    if (visible < 2) return;
+    const startIdx = len - visible - history.viewOffset;
 
     ctx.clearRect(0, 0, w, h);
 
@@ -156,40 +286,42 @@ function drawGraph(ctx, w, h) {
 
     const stepX = w / (GRAPH_POINTS - 1);
     const yFor = val => h - (val / total) * h;
+    // right-align partial windows so new data flows in from the right
+    const dataStartX = (GRAPH_POINTS - visible) * stepX;
+    const xFor = i => (GRAPH_POINTS - visible + i) * stepX;
+    const at = (arr, i) => historyGet(arr, startIdx + i);
 
     // aimdo area
-    const dataStartX = (GRAPH_POINTS - len) * stepX;
     ctx.beginPath();
     ctx.moveTo(dataStartX, h);
-    for (let i = 0; i < len; i++) {
-        ctx.lineTo((GRAPH_POINTS - len + i) * stepX, yFor(historyGet(history.aimdo_usage, i)));
+    for (let i = 0; i < visible; i++) {
+        ctx.lineTo(xFor(i), yFor(at(history.aimdo_usage, i)));
     }
-    ctx.lineTo((GRAPH_POINTS - 1) * stepX, h);
+    ctx.lineTo(xFor(visible - 1), h);
     ctx.closePath();
-    ctx.fillStyle = "rgba(230,126,34,0.35)";
+    ctx.fillStyle = hexToRgba(C.vram, 0.35);
     ctx.fill();
 
-    // torch area stacked
+    // torch area stacked on top of aimdo
     ctx.beginPath();
-    ctx.moveTo(dataStartX, yFor(historyGet(history.aimdo_usage, 0)));
-    for (let i = 0; i < len; i++) {
-        const x = (GRAPH_POINTS - len + i) * stepX;
-        ctx.lineTo(x, yFor(historyGet(history.aimdo_usage, i) + historyGet(history.torch_active, i)));
+    ctx.moveTo(dataStartX, yFor(at(history.aimdo_usage, 0)));
+    for (let i = 0; i < visible; i++) {
+        ctx.lineTo(xFor(i), yFor(at(history.aimdo_usage, i) + at(history.torch_active, i)));
     }
-    for (let i = len - 1; i >= 0; i--) {
-        ctx.lineTo((GRAPH_POINTS - len + i) * stepX, yFor(historyGet(history.aimdo_usage, i)));
+    for (let i = visible - 1; i >= 0; i--) {
+        ctx.lineTo(xFor(i), yFor(at(history.aimdo_usage, i)));
     }
     ctx.closePath();
-    ctx.fillStyle = "rgba(46,204,113,0.4)";
+    ctx.fillStyle = hexToRgba(C.torch, 0.4);
     ctx.fill();
 
     // total used line
     ctx.beginPath();
     ctx.strokeStyle = C.totalLine;
     ctx.lineWidth = 1.5;
-    for (let i = 0; i < len; i++) {
-        const x = (GRAPH_POINTS - len + i) * stepX;
-        const y = yFor(total - historyGet(history.free_vram, i));
+    for (let i = 0; i < visible; i++) {
+        const x = xFor(i);
+        const y = yFor(total - at(history.free_vram, i));
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
@@ -204,19 +336,73 @@ function drawGraph(ctx, w, h) {
     ctx.stroke();
     ctx.setLineDash([]);
 
+    // execution start/end markers — vertical dashed lines positioned by timestamp.
+    // Start: torch green (workflow active), end: dim gray (idle).
+    if (history.execEvents.length) {
+        const tStart = historyGet(history.times, startIdx);
+        const tEnd = historyGet(history.times, startIdx + visible - 1);
+        const tRange = tEnd - tStart;
+        if (tRange > 0) {
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 3]);
+            for (const evt of history.execEvents) {
+                if (evt.time < tStart || evt.time > tEnd) continue;
+                const x = dataStartX + ((evt.time - tStart) / tRange) * (visible - 1) * stepX;
+                ctx.strokeStyle = evt.type === "start" ? C.torch : C.gpuUtilHi;
+                ctx.beginPath();
+                ctx.moveTo(x + 0.5, 0);
+                ctx.lineTo(x + 0.5, h);
+                ctx.stroke();
+            }
+            ctx.setLineDash([]);
+        }
+    }
+
     // gpu line uses its own 0..100 scale, not the VRAM byte scale
     if (gpuLineVisible) {
         ctx.beginPath();
         ctx.strokeStyle = C.gpuUtil;
         ctx.lineWidth = 1.25;
-        for (let i = 0; i < len; i++) {
-            const x = (GRAPH_POINTS - len + i) * stepX;
-            const y = h - (historyGet(history.gpu_util, i) / 100) * h;
-            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        for (let i = 0; i < visible; i++) {
+            const y = h - (at(history.gpu_util, i) / 100) * h;
+            if (i === 0) ctx.moveTo(xFor(i), y); else ctx.lineTo(xFor(i), y);
         }
         ctx.stroke();
     }
+
+    if (graphHover.x != null && graphHover.idx != null) {
+        const hi = graphHover.idx - startIdx;
+        if (hi >= 0 && hi < visible) {
+            ctx.strokeStyle = C.vram;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(graphHover.x + 0.5, 0);
+            ctx.lineTo(graphHover.x + 0.5, h);
+            ctx.stroke();
+
+            // dots on the lines crossed by the hover line. Stroke around each dot
+            // in the graph bg so it pops off the colored area fills behind it.
+            const dot = (x, y, fill) => {
+                ctx.beginPath();
+                ctx.arc(x, y, 3, 0, Math.PI * 2);
+                ctx.fillStyle = fill;
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = C.graphBg;
+                ctx.stroke();
+            };
+            const totalY = yFor(total - at(history.free_vram, hi));
+            dot(graphHover.x, totalY, C.totalLine);
+            if (gpuLineVisible) {
+                const gpuY = h - (at(history.gpu_util, hi) / 100) * h;
+                dot(graphHover.x, gpuY, C.gpuUtil);
+            }
+        }
+    }
 }
+
+// hover-line state for the graph; null when cursor is outside the data range.
+const graphHover = { x: null, idx: null };
 
 // per-model residency diff state
 const modelState = {};
@@ -241,9 +427,11 @@ function diffResidency(key, residency) {
 }
 
 // draw page grid to canvas — much faster than 700 DOM divs.
-// cssW is logical (panel-local) drawing width; panelScale combines with devicePixelRatio
-// so backing pixels match the device while cells stay 6 logical px (scaling with panel zoom).
-function drawPageGrid(ctx, cssW, residency, changeAge, panelScale) {
+// vramColor (hex) tints static cells and the fade-in landing color per model.
+function drawPageGrid(ctx, cssW, residency, changeAge, panelScale, vramColor) {
+    const vramHex = vramColor || C.vram;
+    const vramRgb = hexToRgb(vramHex);
+    const fadeInFromRgb = lightenRgb(vramRgb, 0.55);
     const cellSize = 6;
     const gap = 1;
     const step = cellSize + gap;
@@ -256,6 +444,14 @@ function drawPageGrid(ctx, cssW, residency, changeAge, panelScale) {
     const canvas = ctx.canvas;
     const backingW = Math.max(1, Math.round(cssW * totalScale));
     const backingH = Math.max(1, Math.round((cssH || 1) * totalScale));
+
+    // skip draw when nothing's animating and inputs match the previous call.
+    let anyAnimating = false;
+    for (let i = 0; i < changeAge.length; i++) if (changeAge[i] > 0) { anyAnimating = true; break; }
+    const sig = `${vramHex}|${C.unloaded}|${backingW}x${backingH}|${residency.length}`;
+    if (!anyAnimating && canvas._lastSig === sig) return;
+    canvas._lastSig = sig;
+
     if (canvas.width !== backingW) canvas.width = backingW;
     if (canvas.height !== backingH) canvas.height = backingH;
     canvas.style.height = (cssH || 1) + "px";
@@ -265,7 +461,7 @@ function drawPageGrid(ctx, cssW, residency, changeAge, panelScale) {
     // batch: draw all static vram cells, then all static unloaded, then animated individually
     const animated = [];
 
-    ctx.fillStyle = C.vram;
+    ctx.fillStyle = vramColor || C.vram;
     for (let i = 0; i < residency.length; i++) {
         if (changeAge[i] > 0) { animated.push(i); continue; }
         if (!(residency[i] & 1)) continue;
@@ -278,12 +474,12 @@ function drawPageGrid(ctx, cssW, residency, changeAge, panelScale) {
         ctx.fillRect((i % cols) * step, Math.floor(i / cols) * step, cellSize, cellSize);
     }
 
-    // animated cells need individual colors
+    // fade-in: lightened type color → type color. fade-out: red → gray (universal "removed").
     for (const i of animated) {
         const resident = residency[i] & 1;
         const t = changeAge[i] / FADE_TICKS;
-        const [fr, fg, fb] = resident ? C.fadeInFrom : C.fadeOutFrom;
-        const [tr, tg, tb] = resident ? C.fadeInTo : C.fadeOutTo;
+        const [fr, fg, fb] = resident ? fadeInFromRgb : C.fadeOutFrom;
+        const [tr, tg, tb] = resident ? vramRgb : C.fadeOutTo;
         ctx.fillStyle = `rgb(${Math.round(fr * t + tr * (1 - t))},${Math.round(fg * t + tg * (1 - t))},${Math.round(fb * t + tb * (1 - t))})`;
         ctx.fillRect((i % cols) * step, Math.floor(i / cols) * step, cellSize, cellSize);
     }
@@ -293,8 +489,36 @@ function createPanel() {
     const saved = loadState();
     if (saved.pollInterval) pollInterval = saved.pollInterval;
     if (typeof saved.gpuLineVisible === "boolean") gpuLineVisible = saved.gpuLineVisible;
+    if (typeof saved.colorModelBars === "boolean") colorModelBars = saved.colorModelBars;
+    if (typeof saved.colorModelStroke === "boolean") colorModelStroke = saved.colorModelStroke;
+    if (typeof saved.colorModelName === "boolean") colorModelName = saved.colorModelName;
+    if (typeof saved.showLegends === "boolean") showLegends = saved.showLegends;
+    if (typeof saved.showRamInMini === "boolean") showRamInMini = saved.showRamInMini;
+    if (typeof saved.showVramInMini === "boolean") showVramInMini = saved.showVramInMini;
+    if (typeof saved.showGpuInMini === "boolean") showGpuInMini = saved.showGpuInMini;
+    if (typeof saved.showCpuInMini === "boolean") showCpuInMini = saved.showCpuInMini;
+    if (typeof saved.showHwNames === "boolean") showHwNames = saved.showHwNames;
+    if (typeof saved.graphHeight === "number" && saved.graphHeight > 0) graphHeight = saved.graphHeight;
+    if (typeof saved.theme === "string" && THEMES[saved.theme]) {
+        currentTheme = saved.theme;
+        applyPalette(currentTheme);
+    }
     if (saved.modelCollapsed && typeof saved.modelCollapsed === "object") modelCollapsed = saved.modelCollapsed;
     let panelScale = typeof saved.scale === "number" ? saved.scale : 1;
+
+    // injected once; guarded against duplicate re-init.
+    if (!document.getElementById("aimdo-viz-style")) {
+        const s = document.createElement("style");
+        s.id = "aimdo-viz-style";
+        s.textContent = `
+            #aimdo-models { scrollbar-width: thin; scrollbar-color: ${C.btn} transparent; }
+            #aimdo-models::-webkit-scrollbar { width: 8px; }
+            #aimdo-models::-webkit-scrollbar-track { background: transparent; }
+            #aimdo-models::-webkit-scrollbar-thumb { background: ${C.btn}; border-radius: 4px; }
+            #aimdo-models::-webkit-scrollbar-thumb:hover { background: ${C.textDim}; }
+        `;
+        document.head.appendChild(s);
+    }
 
     const panel = document.createElement("div");
     panel.id = "aimdo-viz-panel";
@@ -303,20 +527,28 @@ function createPanel() {
         background: ${C.bg}; color: ${C.text};
         border: 1px solid ${C.border}; border-radius: 8px;
         padding: 0; font-family: monospace; font-size: 12px;
-        z-index: 50; min-width: 200px; width: 340px; max-width: 100vw; max-height: 90vh;
+        z-index: 50; min-width: 200px; width: 340px; max-width: 100vw;
         box-shadow: 0 4px 12px rgba(0,0,0,0.7);
-        user-select: none; overflow-y: auto;
+        user-select: none; display: flex; flex-direction: column;
     `;
     panel.style.zoom = panelScale;
     panel._scale = panelScale;
     if (saved.width != null) panel.style.width = Math.min(saved.width, window.innerWidth) / panelScale + "px";
+    // explicit height only when expanded; collapsed shrinks to header.
+    // separate height persistence per mode — expanding/collapsing loads the right one
+    const initialHeight = saved.collapsed ? saved.heightCollapsed : saved.height;
+    if (initialHeight != null) panel.style.height = Math.min(initialHeight, window.innerHeight) / panelScale + "px";
 
-    // CSS min/max-width/height are pre-zoom (logical), so divide visual targets
-    // by panelScale to land at the intended viewport-pixel limits.
+    // CSS sizes are pre-zoom (logical); divide visual targets by panelScale.
+    // 50vh cap when auto-growing; relaxes to viewport when user sets explicit height.
+    let pipWindow = null;  // set when the panel is moved into a PiP window
+    const isPoppedOut = () => pipWindow && !pipWindow.closed;
     function applyConstraints() {
+        if (isPoppedOut()) return;  // PiP fills its own window; main-page bounds don't apply
+        const heightCapFrac = panel.style.height ? 1.0 : 0.5;
         panel.style.minWidth = (200 / panelScale) + "px";
         panel.style.maxWidth = (window.innerWidth / panelScale) + "px";
-        panel.style.maxHeight = (window.innerHeight * 0.9 / panelScale) + "px";
+        panel.style.maxHeight = (window.innerHeight * heightCapFrac / panelScale) + "px";
     }
     applyConstraints();
 
@@ -380,12 +612,8 @@ function createPanel() {
         return bottom;
     }
 
-    // horizontal constraints from the side toolbar(s). ComfyUI lets the user dock
-    // .side-toolbar-container on either edge; classify each instance by which edge
-    // it hugs and produce minLeft / maxRight in one pass. Side toolbars are opaque
-    // bars (unlike .actionbar-container's transparent gutter), so clamp to the
-    // container's edge rather than walking into leaf icons — otherwise the panel
-    // slips under the bar's internal padding.
+    // side toolbar can dock left or right; classify each by anchored edge.
+    // opaque bars clamp at the container edge (not at leaf icons — would slip under padding).
     function isLeftAnchored(r) { return r.left < 8; }
     function isRightAnchored(r) { return window.innerWidth - r.right < 8; }
     function getSideChromeBounds(panelTop, panelBottom) {
@@ -422,8 +650,7 @@ function createPanel() {
         const boLo = b.bottom - vh;
         const boClamped = boHi < boLo ? boHi : Math.max(boLo, Math.min(bo, boHi));
 
-        // roLo is the larger of: keep panel right within viewport, keep panel right
-        // left of right-docked chrome. Either way, ro must be >= the constraint.
+        // roLo combines viewport-right and right-chrome constraints (whichever is tighter).
         const roHi = b.right - w - minLeft;
         const roLo = Math.max(b.right - vw, b.right - maxRight);
         const roClamped = roHi < roLo ? roHi : Math.max(roLo, Math.min(ro, roHi));
@@ -434,6 +661,7 @@ function createPanel() {
     // CSS zoom scales style.left/top along with size, so we divide by panelScale to land at
     // the intended viewport position rather than position × scale.
     function applyOffsets() {
+        if (pipWindow && !pipWindow.closed) return;  // PiP owns layout while popped out
         const { ro, bo, b, w, h } = clampOffsets(rightOffset, bottomOffset);
         panel.style.left = ((b.right - w - ro) / panelScale) + "px";
         panel.style.top = ((b.bottom - h - bo) / panelScale) + "px";
@@ -455,33 +683,33 @@ function createPanel() {
 
     const miniBar = document.createElement("div");
     miniBar.style.cssText = `display:none;padding:4px 10px 6px;font-size:10px;color:${C.textDim};`;
-    miniBar.innerHTML = `<div style="display:flex;justify-content:space-between;margin-bottom:2px;">
-        <span>RAM</span><span class="mini-ram-usage"></span>
+    miniBar.innerHTML = `<div class="mini-ram-section">
+        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+            <span>RAM</span><span class="mini-ram-usage"></span>
+        </div>
+        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-ram-bar"></div>
     </div>
-    <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-ram-bar"></div>
-    <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
-        <span>VRAM</span><span class="mini-vram-usage"></span>
+    <div class="mini-vram-section">
+        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+            <span>VRAM</span><span class="mini-vram-usage"></span>
+        </div>
+        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-vram-bar"></div>
     </div>
-    <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-vram-bar"></div>
-    <div style="display:flex;justify-content:space-between;margin-bottom:2px;" class="mini-gpu-row">
-        <span>GPU</span><span class="mini-gpu-usage"></span>
+    <div class="mini-cpu-section">
+        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+            <span class="mini-cpu-label">CPU</span><span class="mini-cpu-usage"></span>
+        </div>
+        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-cpu-bar"><div class="mini-cpu-fill" style="height:100%;width:0;transition:width 0.35s ease-out,background 0.35s ease-out;"></div></div>
     </div>
-    <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;" class="mini-gpu-bar"></div>`;
+    <div class="mini-gpu-section">
+        <div style="display:flex;justify-content:space-between;margin-bottom:2px;" class="mini-gpu-row">
+            <span class="mini-gpu-label">GPU</span><span class="mini-gpu-usage"></span>
+        </div>
+        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;" class="mini-gpu-bar"><div class="mini-gpu-fill" style="height:100%;width:0;transition:width 0.35s ease-out,background 0.35s ease-out;"></div></div>
+    </div>`;
 
     const headerRight = document.createElement("div");
     headerRight.style.cssText = "display:flex;align-items:center;gap:6px;";
-
-    const intervalSelect = document.createElement("select");
-    intervalSelect.title = "Polling interval — how often the panel refreshes VRAM/RAM stats";
-    intervalSelect.style.cssText = `font-size:9px;background:${C.btn};color:${C.btnText};border:none;border-radius:2px;padding:1px 2px;cursor:pointer;`;
-    for (const ms of [100, 250, 500, 1000, 2000, 5000]) {
-        const opt = document.createElement("option");
-        opt.value = ms;
-        opt.textContent = ms < 1000 ? `${ms}ms` : `${ms/1000}s`;
-        if (ms === pollInterval) opt.selected = true;
-        intervalSelect.appendChild(opt);
-    }
-    intervalSelect.addEventListener("change", () => { pollInterval = parseInt(intervalSelect.value); saveState({ pollInterval }); });
 
     const unloadBtn = document.createElement("span");
     unloadBtn.textContent = "unload ▾";
@@ -555,10 +783,61 @@ function createPanel() {
         peakVramUsed = 0;
         history.head = 0;
         history.len = 0;
+        history.viewOffset = 0;
+        history.followLive = true;
         history.torch_active.fill(0);
         history.aimdo_usage.fill(0);
         history.free_vram.fill(0);
         history.gpu_util.fill(0);
+        history.times.fill(0);
+        history.execEvents.length = 0;
+        try { localStorage.removeItem(HISTORY_STORAGE_KEY); } catch {}
+    });
+
+    const popoutBtn = document.createElement("span");
+    popoutBtn.textContent = "\u2924";
+    popoutBtn.title = "Pop out into a Picture-in-Picture window";
+    popoutBtn.style.cssText = `cursor:pointer;font-size:12px;padding:0 4px;color:${C.btnText};`;
+    popoutBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (pipWindow && !pipWindow.closed) { pipWindow.close(); return; }
+        if (!window.documentPictureInPicture) {
+            alert("Picture-in-Picture isn't supported here. Try Chrome or Edge.");
+            return;
+        }
+        const r = panel.getBoundingClientRect();
+        pipWindow = await window.documentPictureInPicture.requestWindow({
+            width: Math.max(280, Math.round(r.width)),
+            height: Math.max(200, Math.round(r.height)),
+        });
+        // copy the injected scrollbar stylesheet so #aimdo-models scrolls right
+        const styleSrc = document.getElementById("aimdo-viz-style");
+        if (styleSrc) pipWindow.document.head.appendChild(styleSrc.cloneNode(true));
+        // remember origins so we can restore on close
+        const moved = [];
+        const remember = el => moved.push({ el, parent: el.parentNode, next: el.nextSibling });
+        remember(panel);
+        for (const m of [rootMenu, unloadMenu, ...allSubmenus]) remember(m);
+        const origPanelCss = panel.style.cssText;
+        // fill the PiP window; drop the fixed positioning the main-page math expects
+        Object.assign(panel.style, {
+            position: "static", left: "auto", top: "auto", right: "auto", bottom: "auto",
+            width: "100%", height: "100vh", maxWidth: "none", maxHeight: "none",
+            border: "none", borderRadius: "0", boxShadow: "none",
+        });
+        pipWindow.document.body.style.margin = "0";
+        pipWindow.document.body.style.background = C.bg;
+        for (const { el } of moved) pipWindow.document.body.appendChild(el);
+        pipWindow.addEventListener("pagehide", () => {
+            panel.style.cssText = origPanelCss;
+            for (const { el, parent, next } of moved) {
+                if (!parent) continue;
+                if (next && next.parentNode === parent) parent.insertBefore(el, next);
+                else parent.appendChild(el);
+            }
+            pipWindow = null;
+            applyOffsets();
+        }, { once: true });
     });
 
     const toggleBtn = document.createElement("span");
@@ -568,7 +847,7 @@ function createPanel() {
 
     const body = document.createElement("div");
     body.id = "aimdo-viz-body";
-    body.style.cssText = "padding: 8px 10px;";
+    body.style.cssText = "padding: 8px 10px; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden;";
 
     let collapsed = !!saved.collapsed;
     if (collapsed) {
@@ -579,15 +858,20 @@ function createPanel() {
     toggleBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         collapsed = !collapsed;
-        body.style.display = collapsed ? "none" : "block";
+        body.style.display = collapsed ? "none" : "flex";
         miniBar.style.display = collapsed ? "block" : "none";
         toggleBtn.textContent = collapsed ? "+" : "\u2212";
+        // each mode persists its own height so toggling restores the right size.
+        const s = loadState();
+        const h = collapsed ? s.heightCollapsed : s.height;
+        panel.style.height = h != null ? (Math.min(h, window.innerHeight) / panelScale + "px") : "";
+        applyConstraints();
         saveState({ collapsed });
     });
 
-    headerRight.appendChild(intervalSelect);
     headerRight.appendChild(resetBtn);
     headerRight.appendChild(unloadBtn);
+    headerRight.appendChild(popoutBtn);
     headerRight.appendChild(toggleBtn);
     header.appendChild(headerRight);
     panel.appendChild(header);
@@ -646,8 +930,8 @@ function createPanel() {
         dragging = false;
     });
 
-    // edge resize handles — left grows leftward (right edge is dock anchor, ro stays);
-    // right grows rightward (left edge gets anchored via ResizeObserver's ro delta)
+    // edge handles: left grows left (right edge anchored), right grows right (left
+    // edge anchored via RO ro-delta), bottom grows down (top edge anchored via bo-delta).
     let suppressWidthAnchor = false;
     let edgeDrag = null;
     function makeEdgeHandle(side) {
@@ -658,9 +942,7 @@ function createPanel() {
             if (e.button !== 0) return;
             e.preventDefault();
             e.stopPropagation();
-            // anchor stays put; the other edge must respect the side-chrome bound
-            // on its travel direction. Compute maxWidth once at drag start so the
-            // ResizeObserver-driven ro shift during the drag can't shift the cap.
+            // captured at drag start so the RO ro-shift mid-drag can't move the cap.
             const r = panel.getBoundingClientRect();
             const { minLeft, maxRight } = getSideChromeBounds(r.top, r.bottom);
             const maxWidth = side === "right" ? maxRight - r.left : r.right - minLeft;
@@ -672,21 +954,103 @@ function createPanel() {
     makeEdgeHandle("left");
     makeEdgeHandle("right");
 
+    // collapsed: can't shrink below header + miniBar. expanded: keep modelsDiv top visible.
+    function computeMinHeight(panelRect) {
+        if (collapsed) return miniBar.getBoundingClientRect().bottom - panelRect.top + 2;
+        if (refs && refs.modelsDiv) {
+            return Math.max(40, refs.modelsDiv.getBoundingClientRect().top - panelRect.top + 8);
+        }
+        return 80;
+    }
+
+    let bottomDrag = null;
+    function makeBottomHandle() {
+        const h = document.createElement("div");
+        h.title = "Drag to resize";
+        // inset from the side handles so corners go to the ew-resize handles
+        h.style.cssText = `position:absolute;left:4px;right:4px;bottom:0;height:4px;cursor:ns-resize;z-index:1;`;
+        h.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const r = panel.getBoundingClientRect();
+            const minHeight = computeMinHeight(r);
+            const maxHeight = window.innerHeight - r.top;
+            bottomDrag = { startY: e.clientY, startHeight: r.height, minHeight, maxHeight };
+        });
+        panel.appendChild(h);
+    }
+    makeBottomHandle();
+
+    // bottom-right corner handle: diagonal width+height drag with visible grip.
+    let cornerDrag = null;
+    function cornerGripBg() {
+        return `linear-gradient(135deg,
+            transparent 50%,
+            ${C.textDim} 50%, ${C.textDim} 60%,
+            transparent 60%, transparent 75%,
+            ${C.textDim} 75%, ${C.textDim} 85%,
+            transparent 85%)`;
+    }
+    function makeCornerHandle() {
+        const h = document.createElement("div");
+        h.title = "Drag to resize";
+        h.className = "aimdo-corner-handle";
+        h.style.cssText = `position:absolute;right:0;bottom:0;width:12px;height:12px;cursor:nwse-resize;z-index:2;background:${cornerGripBg()};border-bottom-right-radius:4px;opacity:0.55;`;
+        h.addEventListener("mouseenter", () => h.style.opacity = "1");
+        h.addEventListener("mouseleave", () => h.style.opacity = "0.55");
+        h.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const r = panel.getBoundingClientRect();
+            const { minLeft, maxRight } = getSideChromeBounds(r.top, r.bottom);
+            cornerDrag = {
+                startX: e.clientX, startY: e.clientY,
+                startWidth: r.width, startHeight: r.height,
+                maxWidth: maxRight - r.left,
+                maxHeight: window.innerHeight - r.top,
+                minHeight: computeMinHeight(r),
+            };
+        });
+        panel.appendChild(h);
+    }
+    makeCornerHandle();
+
     document.addEventListener("mousemove", (e) => {
         if (!edgeDrag) return;
         const delta = e.clientX - edgeDrag.startX;
         const newWidth = edgeDrag.side === "left" ? edgeDrag.startWidth - delta : edgeDrag.startWidth + delta;
         panel.style.width = Math.max(200, Math.min(edgeDrag.maxWidth, newWidth)) / panelScale + "px";
     });
+    document.addEventListener("mousemove", (e) => {
+        if (!bottomDrag) return;
+        const delta = e.clientY - bottomDrag.startY;
+        const newHeight = Math.max(bottomDrag.minHeight, Math.min(bottomDrag.maxHeight, bottomDrag.startHeight + delta));
+        panel.style.height = (newHeight / panelScale) + "px";
+        // relax the 50vh auto-grow cap once user sets an explicit height.
+        applyConstraints();
+    });
+    document.addEventListener("mousemove", (e) => {
+        if (!cornerDrag) return;
+        const dx = e.clientX - cornerDrag.startX;
+        const dy = e.clientY - cornerDrag.startY;
+        const newWidth = Math.max(200, Math.min(cornerDrag.maxWidth, cornerDrag.startWidth + dx));
+        const newHeight = Math.max(cornerDrag.minHeight, Math.min(cornerDrag.maxHeight, cornerDrag.startHeight + dy));
+        panel.style.width = (newWidth / panelScale) + "px";
+        panel.style.height = (newHeight / panelScale) + "px";
+        applyConstraints();
+    });
     document.addEventListener("mouseup", () => {
         if (edgeDrag) {
             edgeDrag = null;
             suppressWidthAnchor = false;
         }
+        if (bottomDrag) bottomDrag = null;
+        if (cornerDrag) cornerDrag = null;
     });
 
-    const scaleMenu = document.createElement("div");
-    scaleMenu.style.cssText = `
+    const MENU_CSS = `
         display:none; position:fixed; z-index:52;
         background:${C.headerBg}; color:${C.text};
         border:1px solid ${C.border}; border-radius:4px;
@@ -694,25 +1058,85 @@ function createPanel() {
         box-shadow:0 4px 12px rgba(0,0,0,0.7);
         font-family:monospace; font-size:10px;
     `;
-    const scaleLabel = document.createElement("div");
-    scaleLabel.textContent = "Scale";
-    scaleLabel.style.cssText = `padding:3px 10px;color:${C.textDim};font-size:9px;text-transform:uppercase;`;
-    scaleMenu.appendChild(scaleLabel);
+    // fixed-width span keeps width stable when items toggle the checkmark on/off.
+    const CHECK_SLOT = `display:inline-block;width:12px;text-align:center;`;
 
+    function makeMenu() {
+        const m = document.createElement("div");
+        m.style.cssText = MENU_CSS;
+        return m;
+    }
+    const rootMenu = makeMenu();
+    const scaleSubmenu = makeMenu();
+    const pollSubmenu = makeMenu();
+    const displaySubmenu = makeMenu();
+    const miniSubmenu = makeMenu();
+    const themeSubmenu = makeMenu();
+    const allSubmenus = [scaleSubmenu, pollSubmenu, displaySubmenu, miniSubmenu, themeSubmenu];
+    function closeAllSubmenus() { for (const m of allSubmenus) m.style.display = "none"; }
+
+    // submenu overlaps parent by 1px so mouse transit doesn't trigger mouseleave-close.
+    function openSubmenu(parentItem, submenu) {
+        closeAllSubmenus();
+        submenu.style.zoom = panelScale;
+        submenu.style.display = "block";
+        const rootR = rootMenu.getBoundingClientRect();
+        const itemR = parentItem.getBoundingClientRect();
+        const subR = submenu.getBoundingClientRect();
+        let left = rootR.right - 1;
+        if (left + subR.width > window.innerWidth) left = Math.max(2, rootR.left - subR.width + 1);
+        submenu.style.left = (left / panelScale) + "px";
+        submenu.style.top = (Math.min(itemR.top, window.innerHeight - subR.height - 4) / panelScale) + "px";
+    }
+
+    // factory for a checkbox-style toggle item bound to a module-level flag.
+    function makeToggleItem(label, getValue, setValue, stateKey) {
+        const item = document.createElement("div");
+        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+        item.addEventListener("mouseenter", () => item.style.background = C.btn);
+        item.addEventListener("mouseleave", () => item.style.background = "");
+        const render = () => {
+            item.innerHTML = `<span style="${CHECK_SLOT}">${getValue() ? "✓" : ""}</span>${label}`;
+        };
+        render();
+        item.addEventListener("click", (e) => {
+            e.stopPropagation();
+            setValue(!getValue());
+            saveState({ [stateKey]: getValue() });
+            render();
+            // visible change kicks in on the next poll tick (<= pollInterval ms).
+        });
+        return { item, render };
+    }
+
+    // parent item that opens a submenu on hover; chevron hints at the nesting.
+    function makeSubmenuParent(label, submenu) {
+        const item = document.createElement("div");
+        item.style.cssText = `padding:4px 10px;cursor:default;white-space:nowrap;display:flex;justify-content:space-between;gap:12px;`;
+        item.innerHTML = `<span>${label}</span><span class="aimdo-chevron" style="color:${C.textDim};">▸</span>`;
+        item.addEventListener("mouseenter", () => { item.style.background = C.btn; openSubmenu(item, submenu); });
+        item.addEventListener("mouseleave", () => { item.style.background = ""; });
+        return item;
+    }
+
+    // --- Scale submenu
     const scalePresets = [0.75, 1, 1.25, 1.5, 1.75, 2];
     const scaleItems = new Map();
     function renderScaleItems() {
         for (const [s, item] of scaleItems) {
-            item.textContent = `${Math.abs(s - panelScale) < 1e-6 ? "✓ " : "  "}${Math.round(s * 100)}%`;
+            const on = Math.abs(s - panelScale) < 1e-6;
+            item.innerHTML = `<span style="${CHECK_SLOT}">${on ? "✓" : ""}</span>${Math.round(s * 100)}%`;
         }
     }
     function setScale(s) {
-        const w = panel.getBoundingClientRect().width;
+        const r = panel.getBoundingClientRect();
+        const w = r.width, h = r.height;
+        const hadExplicitHeight = panel.style.height !== "";
         panelScale = s;
         panel._scale = s;
         panel.style.zoom = s;
-        // preserve visual width across scale change
         panel.style.width = (w / s) + "px";
+        if (hadExplicitHeight) panel.style.height = (h / s) + "px";
         applyConstraints();
         applyOffsets();
         saveState({ scale: s });
@@ -726,44 +1150,228 @@ function createPanel() {
             e.stopPropagation();
             setScale(s);
             renderScaleItems();
-            scaleMenu.style.display = "none";
+            rootMenu.style.display = "none";
+            closeAllSubmenus();
         });
-        scaleMenu.appendChild(item);
+        scaleSubmenu.appendChild(item);
         scaleItems.set(s, item);
     }
     renderScaleItems();
-    document.body.appendChild(scaleMenu);
+
+    // --- Display submenu
+    const colorBars = makeToggleItem("Color model bars",
+        () => colorModelBars, v => { colorModelBars = v; }, "colorModelBars");
+    const colorStroke = makeToggleItem("Color model stroke",
+        () => colorModelStroke, v => { colorModelStroke = v; }, "colorModelStroke");
+    const colorName = makeToggleItem("Color model name",
+        () => colorModelName, v => { colorModelName = v; }, "colorModelName");
+    const showLeg = makeToggleItem("Show legends",
+        () => showLegends, v => { showLegends = v; }, "showLegends");
+    displaySubmenu.appendChild(colorBars.item);
+    displaySubmenu.appendChild(colorStroke.item);
+    displaySubmenu.appendChild(colorName.item);
+    displaySubmenu.appendChild(showLeg.item);
+
+    // --- Mini view submenu
+    const showRam = makeToggleItem("RAM",
+        () => showRamInMini, v => { showRamInMini = v; }, "showRamInMini");
+    const showVram = makeToggleItem("VRAM",
+        () => showVramInMini, v => { showVramInMini = v; }, "showVramInMini");
+    const showCpu = makeToggleItem("CPU",
+        () => showCpuInMini, v => { showCpuInMini = v; }, "showCpuInMini");
+    const showGpu = makeToggleItem("GPU",
+        () => showGpuInMini, v => { showGpuInMini = v; }, "showGpuInMini");
+    const showNames = makeToggleItem("Device names",
+        () => showHwNames, v => { showHwNames = v; }, "showHwNames");
+    miniSubmenu.appendChild(showRam.item);
+    miniSubmenu.appendChild(showVram.item);
+    miniSubmenu.appendChild(showCpu.item);
+    miniSubmenu.appendChild(showGpu.item);
+    miniSubmenu.appendChild(showNames.item);
+
+    // --- Polling interval submenu (single-select like Scale)
+    const pollPresets = [100, 250, 500, 1000, 2000, 5000];
+    const pollItems = new Map();
+    function renderPollItems() {
+        for (const [ms, item] of pollItems) {
+            const on = ms === pollInterval;
+            const label = ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
+            item.innerHTML = `<span style="${CHECK_SLOT}">${on ? "✓" : ""}</span>${label}`;
+        }
+    }
+    for (const ms of pollPresets) {
+        const item = document.createElement("div");
+        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+        item.addEventListener("mouseenter", () => item.style.background = C.btn);
+        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.addEventListener("click", (e) => {
+            e.stopPropagation();
+            pollInterval = ms;
+            saveState({ pollInterval });
+            renderPollItems();
+            rootMenu.style.display = "none";
+            closeAllSubmenus();
+        });
+        pollSubmenu.appendChild(item);
+        pollItems.set(ms, item);
+    }
+    renderPollItems();
+
+    // --- Theme submenu (single-select; live-applies)
+    function applyTheme(name) {
+        if (!THEMES[name]) return;
+        currentTheme = name;
+        applyPalette(name);
+        // statically-styled chrome needs explicit refresh; dynamic content picks up C.* next tick.
+        panel.style.background = C.bg;
+        panel.style.color = C.text;
+        panel.style.borderColor = C.border;
+        header.style.background = C.headerBg;
+        titleSpan.style.color = C.text;
+        miniBar.style.color = C.textDim;
+        for (const m of [rootMenu, ...allSubmenus]) {
+            m.style.background = C.headerBg;
+            m.style.color = C.text;
+            m.style.borderColor = C.border;
+        }
+        const ss = document.getElementById("aimdo-viz-style");
+        if (ss) {
+            ss.textContent = `
+                #aimdo-models { scrollbar-width: thin; scrollbar-color: ${C.btn} transparent; }
+                #aimdo-models::-webkit-scrollbar { width: 8px; }
+                #aimdo-models::-webkit-scrollbar-track { background: transparent; }
+                #aimdo-models::-webkit-scrollbar-thumb { background: ${C.btn}; border-radius: 4px; }
+                #aimdo-models::-webkit-scrollbar-thumb:hover { background: ${C.textDim}; }
+            `;
+        }
+        for (const b of [unloadBtn, resetBtn]) {
+            b.style.background = C.btn;
+            b.style.color = C.btnText;
+        }
+        toggleBtn.style.color = C.btnText;
+        for (const b of panel.querySelectorAll(".aimdo-unload-btn, .aimdo-reset-wm-btn")) {
+            b.style.background = C.btn;
+            b.style.color = C.btnText;
+        }
+        for (const ch of rootMenu.querySelectorAll(".aimdo-chevron")) {
+            ch.style.color = C.textDim;
+        }
+        const corner = panel.querySelector(".aimdo-corner-handle");
+        if (corner) corner.style.background = cornerGripBg();
+        for (const cls of [".mini-ram-bar", ".mini-vram-bar", ".mini-cpu-bar", ".mini-gpu-bar"]) {
+            const el = miniBar.querySelector(cls);
+            if (el) el.style.background = C.barBg;
+        }
+        if (refs && refs.graphCanvas) refs.graphCanvas.style.background = C.graphBg;
+        // bottomLegend bakes colors into innerHTML — force a rebuild on next tick.
+        if (refs && refs.bottomLegend) {
+            refs.bottomLegend.remove();
+            refs.bottomLegend = null;
+        }
+    }
+    const themeItems = new Map();
+    function renderThemeItems() {
+        for (const [name, item] of themeItems) {
+            const on = name === currentTheme;
+            const label = name[0].toUpperCase() + name.slice(1);
+            item.innerHTML = `<span style="${CHECK_SLOT}">${on ? "✓" : ""}</span>${label}`;
+        }
+    }
+    for (const name of Object.keys(THEMES)) {
+        const item = document.createElement("div");
+        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+        item.addEventListener("mouseenter", () => item.style.background = C.btn);
+        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.addEventListener("click", (e) => {
+            e.stopPropagation();
+            applyTheme(name);
+            saveState({ theme: name });
+            renderThemeItems();
+            rootMenu.style.display = "none";
+            closeAllSubmenus();
+        });
+        themeSubmenu.appendChild(item);
+        themeItems.set(name, item);
+    }
+    renderThemeItems();
+
+    // --- Root menu items
+    rootMenu.appendChild(makeSubmenuParent("Scale", scaleSubmenu));
+    rootMenu.appendChild(makeSubmenuParent("Polling interval", pollSubmenu));
+    rootMenu.appendChild(makeSubmenuParent("Display", displaySubmenu));
+    rootMenu.appendChild(makeSubmenuParent("Mini view", miniSubmenu));
+    rootMenu.appendChild(makeSubmenuParent("Theme", themeSubmenu));
+
+    function renderColorBarsItem() {
+        renderScaleItems(); renderPollItems(); renderThemeItems();
+        colorBars.render(); colorStroke.render(); colorName.render(); showLeg.render();
+        showRam.render(); showVram.render(); showCpu.render(); showGpu.render(); showNames.render();
+    }
+
+    document.body.appendChild(rootMenu);
+    for (const m of allSubmenus) document.body.appendChild(m);
 
     panel.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        renderScaleItems();
-        scaleMenu.style.zoom = panelScale;
-        scaleMenu.style.display = "block";
-        const mRect = scaleMenu.getBoundingClientRect();
+        renderColorBarsItem();
+        closeAllSubmenus();
+        rootMenu.style.zoom = panelScale;
+        rootMenu.style.display = "block";
+        const mRect = rootMenu.getBoundingClientRect();
         const mw = mRect.width || 120 * panelScale;
-        const mh = mRect.height || 160 * panelScale;
-        scaleMenu.style.left = (Math.min(e.clientX, window.innerWidth - mw - 4) / panelScale) + "px";
-        scaleMenu.style.top = (Math.min(e.clientY, window.innerHeight - mh - 4) / panelScale) + "px";
+        const mh = mRect.height || 120 * panelScale;
+        rootMenu.style.left = (Math.min(e.clientX, window.innerWidth - mw - 4) / panelScale) + "px";
+        rootMenu.style.top = (Math.min(e.clientY, window.innerHeight - mh - 4) / panelScale) + "px";
     });
     document.addEventListener("click", (e) => {
-        if (!scaleMenu.contains(e.target)) scaleMenu.style.display = "none";
+        if (rootMenu.contains(e.target)) return;
+        for (const m of allSubmenus) if (m.contains(e.target)) return;
+        rootMenu.style.display = "none";
+        closeAllSubmenus();
     });
+    // moving the mouse out of the menu structure into empty space should also
+    // close the submenu so it doesn't linger over unrelated UI.
+    rootMenu.addEventListener("mouseleave", (e) => {
+        const target = e.relatedTarget;
+        if (target && (target instanceof Node) && allSubmenus.some(m => m.contains(target))) return;
+        closeAllSubmenus();
+    });
+    for (const m of allSubmenus) {
+        m.addEventListener("mouseleave", (e) => {
+            const target = e.relatedTarget;
+            if (target && (target instanceof Node) && (rootMenu.contains(target) || allSubmenus.some(x => x.contains(target)))) return;
+            m.style.display = "none";
+        });
+    }
 
     document.body.appendChild(panel);
     applyOffsets();
 
-    // bottom-right handle changes width → anchor left edge via ro delta;
-    // left handle sets suppressWidthAnchor to keep the right edge anchored instead
+    // width changes shift ro to anchor one edge (unless suppressed by the left handle).
+    // height changes always anchor the top edge by shifting bo by -Δh.
     let lastPanelWidth = null;
+    let lastPanelHeight = null;
     if (typeof ResizeObserver !== "undefined") {
         new ResizeObserver(() => {
-            const w = panel.getBoundingClientRect().width;
+            if (isPoppedOut()) return;  // PiP resize doesn't persist back to main-page state
+            const r = panel.getBoundingClientRect();
+            const w = r.width, h = r.height;
             if (lastPanelWidth !== null && w !== lastPanelWidth) {
                 if (!suppressWidthAnchor) rightOffset -= (w - lastPanelWidth);
                 saveState({ width: w, rightOffset, bottomOffset });
             }
+            if (lastPanelHeight !== null && h !== lastPanelHeight) {
+                bottomOffset -= (h - lastPanelHeight);
+                // persist height only on explicit drag, and key it by current mode so
+                // expanded vs collapsed heights don't overwrite each other.
+                if (bottomDrag || cornerDrag) {
+                    const key = collapsed ? "heightCollapsed" : "height";
+                    saveState({ [key]: h, bottomOffset });
+                } else saveState({ bottomOffset });
+            }
             lastPanelWidth = w;
+            lastPanelHeight = h;
             applyOffsets();
         }).observe(panel);
     }
@@ -800,6 +1408,7 @@ function ensureStructure(body) {
 
     const contentDiv = document.createElement("div");
     contentDiv.id = "aimdo-content";
+    contentDiv.style.cssText = "flex-shrink: 0;";
     contentDiv.addEventListener("click", (e) => {
         const t = e.target.closest(".aimdo-gpu-util");
         if (!t) return;
@@ -810,19 +1419,127 @@ function ensureStructure(body) {
     });
     body.appendChild(contentDiv);
 
+    const graphHeader = document.createElement("div");
+    graphHeader.style.cssText = `display:flex;justify-content:space-between;font-size:9px;color:${C.textDim};margin-bottom:2px;flex-shrink:0;`;
+    graphHeader.innerHTML = `<span class="graph-time-left"></span><span class="graph-hover-info"></span><span class="graph-time-right"></span>`;
+    body.appendChild(graphHeader);
+
     const graphCanvas = document.createElement("canvas");
     graphCanvas.width = 300;
-    graphCanvas.height = 80;
-    graphCanvas.style.cssText = `width:100%;height:80px;border-radius:3px;background:${C.graphBg};`;
+    graphCanvas.height = graphHeight;
+    graphCanvas.style.cssText = `width:100%;height:${graphHeight}px;border-radius:3px;background:${C.graphBg};flex-shrink:0;cursor:crosshair;`;
     body.appendChild(graphCanvas);
+
+    // redraw without waiting for the next poll — used by the scrub-drag handler.
+    const redrawGraph = () => {
+        if (!refs || !refs.graphCtx) return;
+        const panelScale = (body._panel && body._panel._scale) || 1;
+        const gRect = graphCanvas.getBoundingClientRect();
+        if (gRect.width > 0 && gRect.height > 0) {
+            drawGraph(refs.graphCtx, gRect.width / panelScale, gRect.height / panelScale);
+        }
+        updateGraphTimes();
+    };
+
+    graphCanvas.addEventListener("mousemove", (e) => {
+        if (scrubDrag) return;  // hover line during drag is distracting
+        const rect = graphCanvas.getBoundingClientRect();
+        const scale = (body._panel && body._panel._scale) || 1;
+        const x = (e.clientX - rect.left) / scale;
+        const w = rect.width / scale;
+        const stepX = w / (GRAPH_POINTS - 1);
+        const slotIdx = Math.round(x / stepX);
+        const len = history.len;
+        const visible = Math.min(GRAPH_POINTS, len - history.viewOffset);
+        const visibleIdx = slotIdx - (GRAPH_POINTS - visible);
+        if (visible < 1 || visibleIdx < 0 || visibleIdx >= visible) {
+            graphHover.x = null;
+            graphHover.idx = null;
+        } else {
+            const startIdx = len - visible - history.viewOffset;
+            graphHover.idx = startIdx + visibleIdx;
+            graphHover.x = slotIdx * stepX;
+        }
+        redrawGraph();
+    });
+    graphCanvas.addEventListener("mouseleave", () => {
+        graphHover.x = null;
+        graphHover.idx = null;
+        redrawGraph();
+    });
+
+    // drag scrubbing: dragging the full visible window's worth scrolls by GRAPH_POINTS.
+    // Drag right pulls older points into view; releasing at viewOffset 0 re-enables
+    // follow-live so new data slides into the window automatically.
+    let scrubDrag = null;
+    graphCanvas.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const visualScale = (body._panel && body._panel._scale) || 1;
+        scrubDrag = { startX: e.clientX, startOffset: history.viewOffset, scale: visualScale };
+        history.followLive = false;
+        graphCanvas.style.cursor = "grabbing";
+    });
+    document.addEventListener("mousemove", (e) => {
+        if (!scrubDrag) return;
+        const rect = graphCanvas.getBoundingClientRect();
+        const dxPx = (e.clientX - scrubDrag.startX) / scrubDrag.scale;
+        const ptsPerPx = GRAPH_POINTS / Math.max(1, rect.width / scrubDrag.scale);
+        const maxOffset = Math.max(0, history.len - GRAPH_POINTS);
+        history.viewOffset = Math.max(0, Math.min(maxOffset, Math.round(scrubDrag.startOffset + dxPx * ptsPerPx)));
+        redrawGraph();
+    });
+    document.addEventListener("mouseup", () => {
+        if (!scrubDrag) return;
+        scrubDrag = null;
+        graphCanvas.style.cursor = "grab";
+        if (history.viewOffset <= 1) {
+            history.viewOffset = 0;
+            history.followLive = true;
+        }
+        redrawGraph();
+    });
+
+    // drag handle below the graph — adjusts canvas height; modelsDiv takes the rest.
+    const graphResize = document.createElement("div");
+    graphResize.style.cssText = `height:4px;cursor:ns-resize;flex-shrink:0;margin:1px 0;`;
+    graphResize.title = "Drag to resize graph";
+    let graphDrag = null;
+    graphResize.addEventListener("mouseenter", () => graphResize.style.background = C.btn);
+    graphResize.addEventListener("mouseleave", () => { if (!graphDrag) graphResize.style.background = ""; });
+    graphResize.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        graphDrag = { startY: e.clientY, startHeight: graphCanvas.getBoundingClientRect().height };
+    });
+    document.addEventListener("mousemove", (e) => {
+        if (!graphDrag) return;
+        const visualScale = (body._panel && body._panel._scale) || 1;
+        const delta = (e.clientY - graphDrag.startY) / visualScale;
+        const next = Math.max(20, Math.min(600, graphDrag.startHeight / visualScale + delta));
+        graphHeight = Math.round(next);
+        graphCanvas.style.height = graphHeight + "px";
+    });
+    document.addEventListener("mouseup", () => {
+        if (graphDrag) {
+            graphDrag = null;
+            graphResize.style.background = "";
+            saveState({ graphHeight });
+        }
+    });
+    body.appendChild(graphResize);
 
     const modelsDiv = document.createElement("div");
     modelsDiv.id = "aimdo-models";
+    modelsDiv.style.cssText = "flex: 1 1 auto; min-height: 0; overflow-y: auto;";
     body.appendChild(modelsDiv);
 
     refs = {
         contentDiv,
+        graphHeader,
         graphCanvas,
+        graphResize,
         graphCtx: graphCanvas.getContext("2d"),
         modelsDiv,
         pageCanvases: {},   // keyed by `${index}_${vi}`
@@ -834,9 +1551,46 @@ function ensureStructure(body) {
     return refs;
 }
 
+function updateGraphTimes() {
+    if (!refs || !refs.graphHeader) return;
+    refs.graphHeader.style.color = C.textDim;
+    const leftEl = refs.graphHeader.querySelector(".graph-time-left");
+    const hoverEl = refs.graphHeader.querySelector(".graph-hover-info");
+    const rightEl = refs.graphHeader.querySelector(".graph-time-right");
+    const len = history.len;
+    if (len < 2) {
+        leftEl.textContent = "";
+        hoverEl.textContent = "";
+        rightEl.textContent = "";
+        return;
+    }
+    const visible = Math.min(GRAPH_POINTS, len - history.viewOffset);
+    if (visible < 1) {
+        leftEl.textContent = "";
+        hoverEl.textContent = "";
+        rightEl.textContent = "";
+        return;
+    }
+    const startIdx = len - visible - history.viewOffset;
+    const endIdx = len - 1 - history.viewOffset;
+    leftEl.textContent = formatClock(historyGet(history.times, startIdx));
+    rightEl.textContent = history.followLive ? "live" : formatClock(historyGet(history.times, endIdx));
+    if (graphHover.idx != null) {
+        const used = history.total_vram - historyGet(history.free_vram, graphHover.idx);
+        const parts = [
+            formatClock(historyGet(history.times, graphHover.idx)),
+            formatBytes(used),
+        ];
+        if (gpuLineVisible) parts.push(Math.round(historyGet(history.gpu_util, graphHover.idx)) + "%");
+        hoverEl.textContent = parts.join(" · ");
+    } else {
+        hoverEl.textContent = "";
+    }
+}
+
 function applyRowCollapsed(row) {
     row.bar.style.display = row.collapsed ? "none" : "flex";
-    row.legend.style.display = row.collapsed ? "none" : "flex";
+    row.legend.style.display = (row.collapsed || !showLegends) ? "none" : "flex";
     row.vbarsDiv.style.display = row.collapsed ? "none" : "";
     row.chevron.textContent = row.collapsed ? "▸" : "▾";
 }
@@ -848,7 +1602,8 @@ function renderModelRow(r, m, data) {
     let row = r.modelRows[m.index];
     if (!row) {
         const el = document.createElement("div");
-        el.style.cssText = "margin-top:6px;";
+        // transparent border reserves space so the row size stays constant when the stroke toggles.
+        el.style.cssText = `margin-top:6px;background:${C.rowBg};border:1px solid transparent;border-radius:4px;padding:6px 8px;`;
         const head = document.createElement("div");
         head.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;";
         const nameWrap = document.createElement("span");
@@ -896,6 +1651,14 @@ function renderModelRow(r, m, data) {
     }
 
     row.nameSpan.textContent = m.name + (m.dynamic ? "" : " (static)");
+    const typeColor = MODEL_TYPE_COLOR[m.type];
+    const vramColor = (colorModelBars && typeColor) || C.vram;
+    row.nameSpan.style.color = (colorModelName && typeColor) || C.text;
+    row.el.style.borderColor = (colorModelStroke && typeColor) ? hexToRgba(typeColor, 0.4) : "transparent";
+    // re-applied each tick so theme changes propagate to existing rows.
+    row.el.style.background = C.rowBg;
+    row.bar.style.background = C.barBg;
+    if (!row.collapsed) row.legend.style.display = showLegends ? "flex" : "none";
     row.sizeSpan.textContent = formatBytes(m.total_size);
 
     if (wantsWm && !row.wmBtn) {
@@ -924,6 +1687,8 @@ function renderModelRow(r, m, data) {
         }
         row.lastDynamic = m.dynamic;
     }
+    // re-apply each tick so theme changes reach the segments created once on dynamic-change rebuild.
+    row.barSegs.forEach((seg, i) => { seg.style.background = i === 0 ? vramColor : barColors[i]; });
 
     if (m.dynamic) {
         const pinnedRam = m.pinned_ram || 0;
@@ -939,7 +1704,7 @@ function renderModelRow(r, m, data) {
         row.barSegs[3].style.width = (unloadedSize / total * 100) + "%";
         row.barSegs[3].title = "unloaded: " + formatBytes(unloadedSize);
         row.legend.innerHTML =
-            `<span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.vbar_loaded)}</span>` +
+            `<span><span style="color:${vramColor};">&#9632;</span> VRAM ${formatBytes(m.vbar_loaded)}</span>` +
             (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
             (loadedRam > 0 ? `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
             `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded ${formatBytes(unloadedSize)}</span>`;
@@ -958,7 +1723,7 @@ function renderModelRow(r, m, data) {
         row.barSegs[3].style.width = (otherRam / total * 100) + "%";
         row.barSegs[3].title = "RAM: " + formatBytes(otherRam);
         row.legend.innerHTML =
-            `<span><span style="color:${C.vram};">&#9632;</span> VRAM ${formatBytes(m.loaded_size)}</span>` +
+            `<span><span style="color:${vramColor};">&#9632;</span> VRAM ${formatBytes(m.loaded_size)}</span>` +
             (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
             (loadedRam > 0 ? `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
             (otherRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> RAM ${formatBytes(otherRam)}</span>` : "");
@@ -1005,7 +1770,12 @@ function renderData(body, data) {
         pw >= 320 && data.aimdo_active ? "Memory (aimdo)" :
         pw >= 240 ? "Memory" : "";
     data.gpu_util = smoothGpuUtil(data.gpu_util);
-    pushHistory(data);
+    // throttle history snapshots so a fast poll rate (e.g. 100 ms) doesn't fill
+    // the buffer in 2 minutes; UI keeps updating at the full poll cadence.
+    if (Date.now() - (history.lastPush || 0) >= HISTORY_TICK_MS) {
+        pushHistory(data);
+        history.lastPush = Date.now();
+    }
 
     const used = data.total_vram - data.free_vram;
     if (used > peakVramUsed) peakVramUsed = used;
@@ -1058,11 +1828,27 @@ function renderData(body, data) {
         `<div style="background:${C.python};height:100%;width:${pythonOtherPct}%;"></div>` +
         `<div style="background:${C.other};height:100%;width:${ramOtherPct}%;"></div>`;
 
-    const gpuRow = mb.querySelector(".mini-gpu-row");
-    const gpuBar = mb.querySelector(".mini-gpu-bar");
-    if (data.gpu_util != null) {
-        gpuRow.style.display = "flex";
-        gpuBar.style.display = "flex";
+    mb.querySelector(".mini-ram-section").style.display = showRamInMini ? "" : "none";
+    mb.querySelector(".mini-vram-section").style.display = showVramInMini ? "" : "none";
+    const cpuSection = mb.querySelector(".mini-cpu-section");
+    if (data.cpu_util != null && showCpuInMini) {
+        cpuSection.style.display = "";
+        const cpuColor = gpuUtilColor(data.cpu_util);
+        const cpuPct = Math.round(data.cpu_util);
+        mb.querySelector(".mini-cpu-usage").innerHTML =
+            `<span style="color:${cpuColor};">${(cpuPct < 10 ? "0" : "") + cpuPct}%</span>`;
+        const cpuFill = mb.querySelector(".mini-cpu-fill");
+        cpuFill.style.background = cpuColor;
+        cpuFill.style.width = `${cpuPct}%`;
+        const cpuLabel = mb.querySelector(".mini-cpu-label");
+        cpuLabel.textContent = (showHwNames && data.cpu_name) ? `CPU (${shortenCpuName(data.cpu_name)})` : "CPU";
+        cpuLabel.title = data.cpu_name || "";
+    } else {
+        cpuSection.style.display = "none";
+    }
+    const gpuSection = mb.querySelector(".mini-gpu-section");
+    if (data.gpu_util != null && showGpuInMini) {
+        gpuSection.style.display = "";
         const gpuColor = gpuUtilColor(data.gpu_util);
         const pctStr = (data.gpu_util < 10 ? "0" : "") + data.gpu_util + "%";
         const tempStr = data.gpu_temp != null
@@ -1073,10 +1859,14 @@ function renderData(body, data) {
             : "";
         mb.querySelector(".mini-gpu-usage").innerHTML =
             `<span style="color:${gpuColor};">${pctStr}</span>${tempStr}${powerStr}`;
-        gpuBar.innerHTML = `<div style="background:${gpuColor};height:100%;width:${data.gpu_util}%;"></div>`;
+        const gpuFill = mb.querySelector(".mini-gpu-fill");
+        gpuFill.style.background = gpuColor;
+        gpuFill.style.width = `${data.gpu_util}%`;
+        const gpuLabel = mb.querySelector(".mini-gpu-label");
+        gpuLabel.textContent = (showHwNames && data.gpu_name) ? `GPU (${shortenGpuName(data.gpu_name)})` : "GPU";
+        gpuLabel.title = data.gpu_name || "";
     } else {
-        gpuRow.style.display = "none";
-        gpuBar.style.display = "none";
+        gpuSection.style.display = "none";
     }
 
     r.contentDiv.innerHTML = `<div style="margin-bottom:4px;">
@@ -1090,16 +1880,16 @@ function renderData(body, data) {
             <div style="background:${C.python};height:100%;width:${pythonOtherPct}%;" title="python: ${formatBytes(pythonOther)}"></div>
             <div style="background:${C.other};height:100%;width:${ramOtherPct}%;" title="other: ${formatBytes(ramOther)}"></div>
         </div>
-        <div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
+        ${showLegends ? `<div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
             <span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRamTotal)}</span>
             <span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRamTotal)}</span>
             <span><span style="color:${C.python};">&#9632;</span> python ${formatBytes(pythonOther)}</span>
             <span><span style="color:${C.other};">&#9632;</span> other ${formatBytes(ramOther)}</span>
-        </div>
+        </div>` : ""}
     </div>
     <div style="margin-bottom:4px;">
         <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
-            <span>VRAM</span>
+            <span title="${escHtml(data.gpu_name || "")}">VRAM${(showHwNames && data.gpu_name) ? ` (${escHtml(shortenGpuName(data.gpu_name))})` : ""}</span>
             <span>${formatBytes(used)} / ${formatBytes(data.total_vram)}</span>
         </div>
         <div style="background:${C.barBg};border-radius:3px;height:8px;overflow:hidden;display:flex;">
@@ -1108,12 +1898,12 @@ function renderData(body, data) {
             <div style="background:${C.torchCache};height:100%;width:${torchCachePct}%;" title="cache: ${formatBytes(torchCache)}"></div>
             <div style="background:${C.other};height:100%;width:${otherPct}%;" title="other: ${formatBytes(otherUsed)}"></div>
         </div>
-        <div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
+        ${showLegends ? `<div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
             ${aimdo > 0 ? `<span><span style="color:${C.vram};">&#9632;</span> models ${formatBytes(aimdo)}</span>` : ""}
             ${torchActive > 0 ? `<span><span style="color:${C.torch};">&#9632;</span> torch ${formatBytes(torchActive)}</span>` : ""}
             ${torchCache > 0 ? `<span><span style="color:${C.torchCache};">&#9632;</span> cache ${formatBytes(torchCache)}</span>` : ""}
             <span><span style="color:${C.other};">&#9632;</span> other ${formatBytes(otherUsed)}</span>
-        </div>
+        </div>` : ""}
         <div style="display:flex;gap:10px;font-size:10px;color:${C.textDim};margin-top:2px;">
             <span>peak: ${formatBytes(peakVramUsed)}</span>
             <span>cache: ${formatBytes(data.torch_reserved - data.torch_active)}</span>
@@ -1138,6 +1928,7 @@ function renderData(body, data) {
         if (r.graphCanvas.height !== backingH) r.graphCanvas.height = backingH;
         r.graphCtx.setTransform(totalScale, 0, 0, totalScale, 0, 0);
         drawGraph(r.graphCtx, gRect.width / panelScaleNow, gRect.height / panelScaleNow);
+        updateGraphTimes();
     }
 
     // models section — incremental DOM updates: keep rows across polls, only mutate text/widths
@@ -1181,6 +1972,7 @@ function renderData(body, data) {
             `<span><span style="color:${C.gpuUtil};">&#9472;</span> GPU %</span>`;
         r.modelsDiv.insertBefore(r.bottomLegend, r.modelsDiv.firstChild);
     }
+    r.bottomLegend.style.display = showLegends ? "flex" : "none";
 
     for (const m of data.models) {
         const isNew = !r.modelRows[m.index];
@@ -1208,9 +2000,11 @@ function renderData(body, data) {
             const PAGE = 32 * 1024 * 1024;
             const vramPages = residentCount + pinnedCount;
             const ramPages = vb.residency.length - vramPages;
+            const vramColor = (colorModelBars && MODEL_TYPE_COLOR[m.type]) || C.vram;
+            // swatch carries the category color; text inherits readable textDim.
             ref.stats.innerHTML =
-                `<span style="color:${C.vram};">${vramPages} VRAM (${formatBytes(vramPages * PAGE)})</span>` +
-                ` + <span style="color:${C.unloaded};">${ramPages} unloaded (${formatBytes(ramPages * PAGE)})</span>`;
+                `<span><span style="color:${vramColor};">&#9632;</span> ${vramPages} VRAM (${formatBytes(vramPages * PAGE)})</span>` +
+                ` <span><span style="color:${C.unloaded};">&#9632;</span> ${ramPages} unloaded (${formatBytes(ramPages * PAGE)})</span>`;
 
             let canvas = r.pageCanvases[vkey];
             if (!canvas) {
@@ -1224,7 +2018,7 @@ function renderData(body, data) {
                 || r.modelsDiv.getBoundingClientRect().width
                 || 300 * panelScaleNow;
             const pgCssW = pgVisualW / panelScaleNow;
-            drawPageGrid(r.pageCtxs[vkey], pgCssW, vb.residency, st ? st.changeAge : new Uint8Array(vb.residency.length), panelScaleNow);
+            drawPageGrid(r.pageCtxs[vkey], pgCssW, vb.residency, st ? st.changeAge : new Uint8Array(vb.residency.length), panelScaleNow, colorModelBars ? MODEL_TYPE_COLOR[m.type] : undefined);
         }
     }
 
@@ -1272,11 +2066,14 @@ app.registerExtension({
             execState.running = true;
             execState.node = null;
             execState.progress = null;
+            pushExecEvent("start");
         });
         api.addEventListener("executing", ({ detail }) => {
+            const wasRunning = execState.running;
             execState.running = detail != null;
             execState.node = null;
             execState.progress = null;
+            if (wasRunning && !execState.running) pushExecEvent("end");
         });
         api.addEventListener("progress", ({ detail }) => {
             if (detail) {
