@@ -21,6 +21,12 @@ let showVramInMini = true;
 let showGpuInMini = true;
 let showCpuInMini = true;
 let showHwNames = true;
+let showTitle = true;
+let miniShowNumbers = true;
+let miniShowUnits = true;
+let miniShowType = true;
+let miniShowGpuTemp = true;
+let miniShowGpuPower = true;
 let graphHeight = 80;
 let currentTheme = "default";
 
@@ -95,11 +101,12 @@ function gpuPowerColor(draw_mW, limit_mW) {
     return gpuUtilColor(draw_mW / limit_mW * 100);
 }
 
-function formatPower(draw_mW, limit_mW) {
+function formatPower(draw_mW, limit_mW, withUnit = true) {
     if (draw_mW == null) return null;
     const draw = Math.round(draw_mW / 1000);
-    if (limit_mW == null || limit_mW <= 0) return `${draw}W`;
-    return `${draw}/${Math.round(limit_mW / 1000)}W`;
+    const u = withUnit ? "W" : "";
+    if (limit_mW == null || limit_mW <= 0) return `${draw}${u}`;
+    return `${draw}/${Math.round(limit_mW / 1000)}${u}`;
 }
 
 function formatClock(ms) {
@@ -123,12 +130,12 @@ function shortenCpuName(name) {
         .trim();
 }
 
-function formatBytes(bytes) {
+function formatBytes(bytes, withUnit = true) {
     if (bytes == null) return "?";
     // non-breaking space ( ) so "8.4 GB" never line-wraps between value and unit.
-    if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
-    if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + " MB";
-    return (bytes / 1024).toFixed(0) + " KB";
+    if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + (withUnit ? " GB" : "");
+    if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + (withUnit ? " MB" : "");
+    return (bytes / 1024).toFixed(0) + (withUnit ? " KB" : "");
 }
 
 // rolling history — ring buffer for ~20 min of data at 1s history tick; the visible window of
@@ -498,6 +505,12 @@ function createPanel() {
     if (typeof saved.showGpuInMini === "boolean") showGpuInMini = saved.showGpuInMini;
     if (typeof saved.showCpuInMini === "boolean") showCpuInMini = saved.showCpuInMini;
     if (typeof saved.showHwNames === "boolean") showHwNames = saved.showHwNames;
+    if (typeof saved.showTitle === "boolean") showTitle = saved.showTitle;
+    if (typeof saved.miniShowNumbers === "boolean") miniShowNumbers = saved.miniShowNumbers;
+    if (typeof saved.miniShowUnits === "boolean") miniShowUnits = saved.miniShowUnits;
+    if (typeof saved.miniShowType === "boolean") miniShowType = saved.miniShowType;
+    if (typeof saved.miniShowGpuTemp === "boolean") miniShowGpuTemp = saved.miniShowGpuTemp;
+    if (typeof saved.miniShowGpuPower === "boolean") miniShowGpuPower = saved.miniShowGpuPower;
     if (typeof saved.graphHeight === "number" && saved.graphHeight > 0) graphHeight = saved.graphHeight;
     if (typeof saved.theme === "string" && THEMES[saved.theme]) {
         currentTheme = saved.theme;
@@ -516,6 +529,61 @@ function createPanel() {
             #aimdo-models::-webkit-scrollbar-track { background: transparent; }
             #aimdo-models::-webkit-scrollbar-thumb { background: ${C.btn}; border-radius: 4px; }
             #aimdo-models::-webkit-scrollbar-thumb:hover { background: ${C.textDim}; }
+
+            /* docked mode: flatten the panel into a horizontal row that fits the actionbar */
+            #aimdo-viz-panel.aimdo-docked {
+                position: static !important;
+                left: auto !important; top: auto !important; right: auto !important; bottom: auto !important;
+                width: auto !important; height: auto !important;
+                min-width: 0 !important; max-width: none !important; max-height: none !important;
+                border: none !important; border-radius: 0 !important;
+                box-shadow: none !important; background: transparent !important;
+                flex-direction: row !important; align-items: center;
+                zoom: 1 !important;
+            }
+            #aimdo-viz-panel.aimdo-docked .aimdo-header {
+                padding: 2px 8px !important; background: transparent !important;
+                border-radius: 0 !important; flex-shrink: 0;
+            }
+            #aimdo-viz-panel.aimdo-docked .aimdo-mini-bar {
+                display: flex !important; flex-direction: row !important;
+                padding: 0 !important; gap: 12px; align-items: center;
+                flex: 1 1 auto; min-width: 0;
+            }
+            #aimdo-viz-panel.aimdo-docked .aimdo-mini-bar > * {
+                width: var(--aimdo-dock-section-w, 110px);
+                min-width: var(--aimdo-dock-section-w, 110px);
+                flex: 0 0 auto;
+            }
+            #aimdo-viz-panel.aimdo-docked #aimdo-viz-body { display: none !important; }
+            #aimdo-viz-panel.aimdo-docked.aimdo-docked-expanded #aimdo-viz-body {
+                display: flex !important;
+                position: fixed !important;
+                z-index: 1500;
+                width: 340px; max-height: 60vh;
+                background: ${C.bg}; color: ${C.text};
+                border: 1px solid ${C.border}; border-radius: 6px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.7);
+            }
+            #aimdo-viz-panel.aimdo-docked .aimdo-edge-handle,
+            #aimdo-viz-panel.aimdo-docked .aimdo-corner-handle { display: none !important; }
+
+            /* drop zone shown next to the actionbar items during a drag */
+            .aimdo-dropzone {
+                position: relative; z-index: 1501;
+                order: -1; align-self: stretch; margin: 6px;
+                padding: 0 12px; display: flex; align-items: center; justify-content: center;
+                font-family: monospace; font-size: 11px;
+                border: 2px dashed #3b82f6; border-radius: 6px;
+                background: rgba(59,130,246,0.4); color: #fff;
+                pointer-events: auto; min-width: 160px;
+                opacity: 0.9;
+                transition: transform 0.12s, opacity 0.12s, box-shadow 0.12s, border-width 0.12s;
+            }
+            .aimdo-dropzone.is-hover {
+                opacity: 1; transform: scale(1.04);
+                border-width: 3px; box-shadow: 0 0 20px rgba(59,130,246,0.45);
+            }
         `;
         document.head.appendChild(s);
     }
@@ -662,15 +730,153 @@ function createPanel() {
     // the intended viewport position rather than position × scale.
     function applyOffsets() {
         if (pipWindow && !pipWindow.closed) return;  // PiP owns layout while popped out
+        if (isDocked) return;                        // docked panel lives in the actionbar flex flow
         const { ro, bo, b, w, h } = clampOffsets(rightOffset, bottomOffset);
-        panel.style.left = ((b.right - w - ro) / panelScale) + "px";
-        panel.style.top = ((b.bottom - h - bo) / panelScale) + "px";
+        // while actively dragging, bypass clamping so the user can fly over the topbar
+        // to reach the dock drop zone. mouseup re-clamps before persisting.
+        const useRo = dragging ? rightOffset : ro;
+        const useBo = dragging ? bottomOffset : bo;
+        panel.style.left = ((b.right - w - useRo) / panelScale) + "px";
+        panel.style.top = ((b.bottom - h - useBo) / panelScale) + "px";
         panel.style.right = "auto";
         panel.style.bottom = "auto";
     }
-    window.addEventListener("resize", () => { applyConstraints(); applyOffsets(); });
+    window.addEventListener("resize", () => { applyConstraints(); applyOffsets(); positionDockedBody(); });
+
+    // --- Docking to ComfyUI's top actionbar ---
+    // Same pattern as ComfyActionbar.vue: during a drag we expose a drop zone inside
+    // .actionbar-container; mouseup-while-hovering reparents the panel into that container
+    // and switches it to a flat horizontal mini-bar layout via the .aimdo-docked class.
+    let isDocked = !!saved.docked;
+    let dockSide = saved.dockSide === "left" ? "left" : "right";
+    let dockExpanded = false;     // session-only: body shown as overlay below the docked mini-bar
+    let autoDockPending = false;  // true while the post-load redock poll is running
+    let dockSectionWidth = (typeof saved.dockSectionWidth === "number" && saved.dockSectionWidth > 40)
+        ? saved.dockSectionWidth : 110;
+    let savedPanelCss = null;     // snapshot before docking so undock can restore exact styles
+    let dropZoneLeft = null;      // present only while a drag is in progress
+    let dropZoneRight = null;
+    let dropZoneHoverSide = null; // "left" | "right" | null
+    function applyDockSectionWidth() {
+        panel.style.setProperty("--aimdo-dock-section-w", dockSectionWidth + "px");
+        positionDockedBody();
+    }
+    applyDockSectionWidth();
+
+    // overlay anchored under the docked panel; right-docked panels extend the overlay leftward
+    // so it doesn't get pushed off-screen when the panel sits at the topbar's right edge.
+    function positionDockedBody() {
+        if (!isDocked || !dockExpanded) return;
+        const r = panel.getBoundingClientRect();
+        const overlayW = 340;
+        const anchorLeft = dockSide === "right"
+            ? r.right - overlayW
+            : r.left;
+        const left = Math.max(4, Math.min(window.innerWidth - overlayW - 4, anchorLeft));
+        body.style.top = (r.bottom + 4) + "px";
+        body.style.left = left + "px";
+    }
+
+    function getActionbarContainer() {
+        return document.querySelector(".actionbar-container");
+    }
+
+    // two zones — one before the existing actionbar items, one after — let the user choose
+    // which side to dock on via CSS order on the panel.
+    function makeDropZone(side) {
+        const dz = document.createElement("div");
+        dz.className = "aimdo-dropzone";
+        dz.textContent = "Dock " + side;
+        dz.style.order = side === "left" ? "-2" : "2";
+        dz.addEventListener("mouseenter", () => {
+            if (!dragging) return;
+            dropZoneHoverSide = side;
+            dz.classList.add("is-hover");
+        });
+        dz.addEventListener("mouseleave", () => {
+            if (dropZoneHoverSide === side) dropZoneHoverSide = null;
+            dz.classList.remove("is-hover");
+        });
+        return dz;
+    }
+    function ensureDropZone() {
+        const ac = getActionbarContainer();
+        if (!ac) return null;
+        if (dropZoneLeft && dropZoneLeft.parentNode === ac) return ac;
+        if (dropZoneLeft) dropZoneLeft.remove();
+        if (dropZoneRight) dropZoneRight.remove();
+        dropZoneLeft = makeDropZone("left");
+        dropZoneRight = makeDropZone("right");
+        ac.appendChild(dropZoneLeft);
+        ac.appendChild(dropZoneRight);
+        return ac;
+    }
+    function clearDropZone() {
+        dropZoneHoverSide = null;
+        if (dropZoneLeft) { dropZoneLeft.remove(); dropZoneLeft = null; }
+        if (dropZoneRight) { dropZoneRight.remove(); dropZoneRight = null; }
+    }
+
+    function dock(side) {
+        const ac = getActionbarContainer();
+        if (!ac) return false;
+        if (side === "left" || side === "right") dockSide = side;
+        // CSS order: -1 puts the panel before existing actionbar items (default order 0), +1 after
+        if (isDocked) {
+            panel.style.order = dockSide === "left" ? "-1" : "1";
+            if (panel.parentNode !== ac) ac.appendChild(panel);
+            saveState({ dockSide });
+            return true;
+        }
+        // collapsed mode shows the mini-bar; CSS overrides to lay it out horizontally
+        if (!collapsed) {
+            collapsed = true;
+            body.style.display = "none";
+            miniBar.style.display = "block";
+            toggleBtn.textContent = "+";
+        }
+        dockExpanded = false;
+        // capture before adding order/class so undock restores clean floating styles
+        savedPanelCss = panel.style.cssText;
+        panel.classList.add("aimdo-docked");
+        panel.style.order = dockSide === "left" ? "-1" : "1";
+        ac.appendChild(panel);
+        isDocked = true;
+        saveState({ docked: true, dockSide });
+        return true;
+    }
+
+    function undock() {
+        autoDockPending = false;  // explicit undock cancels any in-flight auto-redock poll
+        if (!isDocked) return;
+        const wasExpanded = dockExpanded;
+        dockExpanded = false;
+        panel.classList.remove("aimdo-docked", "aimdo-docked-expanded");
+        // clear the overlay positioning we set on the body so it returns to normal in-flow layout
+        body.style.top = "";
+        body.style.left = "";
+        if (savedPanelCss != null) panel.style.cssText = savedPanelCss;
+        savedPanelCss = null;
+        document.body.appendChild(panel);
+        isDocked = false;
+        // if they were viewing the full body docked, keep it visible when re-floating
+        if (wasExpanded) {
+            collapsed = false;
+            body.style.display = "flex";
+            miniBar.style.display = "none";
+            toggleBtn.textContent = "−";
+            const s = loadState();
+            const h = s.height;
+            panel.style.height = h != null ? (Math.min(h, window.innerHeight) / panelScale + "px") : "";
+            saveState({ collapsed });
+        }
+        saveState({ docked: false });
+        applyConstraints();
+        applyOffsets();
+    }
 
     const header = document.createElement("div");
+    header.className = "aimdo-header";
     header.style.cssText = `
         display: flex; justify-content: space-between; align-items: center;
         padding: 6px 10px; background: ${C.headerBg};
@@ -682,27 +888,28 @@ function createPanel() {
     header.appendChild(titleSpan);
 
     const miniBar = document.createElement("div");
+    miniBar.className = "aimdo-mini-bar";
     miniBar.style.cssText = `display:none;padding:4px 10px 6px;font-size:10px;color:${C.textDim};`;
     miniBar.innerHTML = `<div class="mini-ram-section">
-        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
-            <span>RAM</span><span class="mini-ram-usage"></span>
+        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
+            <span class="mini-ram-label">RAM</span><span class="mini-ram-usage"></span>
         </div>
         <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-ram-bar"></div>
     </div>
     <div class="mini-vram-section">
-        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
-            <span>VRAM</span><span class="mini-vram-usage"></span>
+        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
+            <span class="mini-vram-label">VRAM</span><span class="mini-vram-usage"></span>
         </div>
         <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-vram-bar"></div>
     </div>
     <div class="mini-cpu-section">
-        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
             <span class="mini-cpu-label">CPU</span><span class="mini-cpu-usage"></span>
         </div>
         <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-cpu-bar"><div class="mini-cpu-fill" style="height:100%;width:0;transition:width 0.35s ease-out,background 0.35s ease-out;"></div></div>
     </div>
     <div class="mini-gpu-section">
-        <div style="display:flex;justify-content:space-between;margin-bottom:2px;" class="mini-gpu-row">
+        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;" class="mini-gpu-row">
             <span class="mini-gpu-label">GPU</span><span class="mini-gpu-usage"></span>
         </div>
         <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;" class="mini-gpu-bar"><div class="mini-gpu-fill" style="height:100%;width:0;transition:width 0.35s ease-out,background 0.35s ease-out;"></div></div>
@@ -718,7 +925,7 @@ function createPanel() {
 
     const unloadMenu = document.createElement("div");
     unloadMenu.style.cssText = `
-        display:none; position:fixed; z-index:51;
+        display:none; position:fixed; z-index:1500;
         background:${C.headerBg}; color:${C.text};
         border:1px solid ${C.border}; border-radius:4px;
         padding:2px 0; min-width:160px;
@@ -774,12 +981,7 @@ function createPanel() {
         }
     });
 
-    const resetBtn = document.createElement("span");
-    resetBtn.textContent = "reset";
-    resetBtn.title = "Reset peak VRAM marker and clear history graph";
-    resetBtn.style.cssText = `cursor:pointer;font-size:10px;padding:1px 6px;background:${C.btn};border-radius:3px;color:${C.btnText};`;
-    resetBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
+    function resetHistory() {
         peakVramUsed = 0;
         history.head = 0;
         history.len = 0;
@@ -792,7 +994,7 @@ function createPanel() {
         history.times.fill(0);
         history.execEvents.length = 0;
         try { localStorage.removeItem(HISTORY_STORAGE_KEY); } catch {}
-    });
+    }
 
     const popoutBtn = document.createElement("span");
     popoutBtn.textContent = "\u2924";
@@ -805,6 +1007,8 @@ function createPanel() {
             alert("Picture-in-Picture isn't supported here. Try Chrome or Edge.");
             return;
         }
+        // PiP rewrites size to fill its window; .aimdo-docked's !important rules would fight it
+        if (isDocked) undock();
         const r = panel.getBoundingClientRect();
         pipWindow = await window.documentPictureInPicture.requestWindow({
             width: Math.max(280, Math.round(r.width)),
@@ -857,6 +1061,19 @@ function createPanel() {
     }
     toggleBtn.addEventListener("click", (e) => {
         e.stopPropagation();
+        // docked: toggle the overlay body below the docked mini-bar; stays docked
+        if (isDocked) {
+            dockExpanded = !dockExpanded;
+            if (dockExpanded) {
+                panel.classList.add("aimdo-docked-expanded");
+                positionDockedBody();
+                toggleBtn.textContent = "\u2212";
+            } else {
+                panel.classList.remove("aimdo-docked-expanded");
+                toggleBtn.textContent = "+";
+            }
+            return;
+        }
         collapsed = !collapsed;
         body.style.display = collapsed ? "none" : "flex";
         miniBar.style.display = collapsed ? "block" : "none";
@@ -869,7 +1086,6 @@ function createPanel() {
         saveState({ collapsed });
     });
 
-    headerRight.appendChild(resetBtn);
     headerRight.appendChild(unloadBtn);
     headerRight.appendChild(popoutBtn);
     headerRight.appendChild(toggleBtn);
@@ -879,12 +1095,42 @@ function createPanel() {
     panel.appendChild(body);
 
     let dragging = false, dx = 0, dy = 0;
+    let dragSavedPointerEvents = null;
+    // pendingDrag distinguishes "clicking a button in the header" from "grabbing to drag".
+    // mousedown only arms; we wait for >DRAG_THRESHOLD px of movement before promoting to a real drag,
+    // so a click on unload/reset/popout never triggers an undock.
+    let pendingDrag = null;
+    const DRAG_THRESHOLD = 5;
+
+    function promoteDrag(e) {
+        if (pendingDrag.dockedAtStart && isDocked) {
+            // jump the now-floating panel under the cursor with a reasonable grab offset
+            undock();
+            const r = panel.getBoundingClientRect();
+            dx = Math.min(r.width - 20, Math.max(20, 40));
+            dy = Math.min(r.height - 8, Math.max(8, 14));
+            const b = getCanvasBounds();
+            rightOffset = b.right - (e.clientX - dx) - r.width;
+            bottomOffset = b.bottom - (e.clientY - dy) - r.height;
+            applyOffsets();
+        }
+        // for non-docked starts, dx/dy were captured at mousedown
+        dragging = true;
+        pendingDrag = null;
+        dragSavedPointerEvents = panel.style.pointerEvents || "";
+        panel.style.pointerEvents = "none";
+        ensureDropZone();
+    }
+
     header.addEventListener("mousedown", (e) => {
         if (e.button !== 0) return;
-        dragging = true;
-        const r = panel.getBoundingClientRect();
-        dx = e.clientX - r.left;
-        dy = e.clientY - r.top;
+        autoDockPending = false;  // user intent overrides the pending auto-redock
+        pendingDrag = { startX: e.clientX, startY: e.clientY, dockedAtStart: isDocked };
+        if (!isDocked) {
+            const r = panel.getBoundingClientRect();
+            dx = e.clientX - r.left;
+            dy = e.clientY - r.top;
+        }
     });
     // Ctrl/Cmd + mousedown anywhere on the panel starts a drag — capture phase
     // so we intercept before child elements (buttons, edge handles) react
@@ -894,13 +1140,15 @@ function createPanel() {
     document.addEventListener("keyup", updateCursor);
     window.addEventListener("blur", () => { panel.style.cursor = ""; });
     panel.addEventListener("mousedown", (e) => {
-        if (!isModifier(e) || dragging) return;
+        if (!isModifier(e) || dragging || pendingDrag) return;
         e.preventDefault();
         e.stopPropagation();
-        dragging = true;
-        const r = panel.getBoundingClientRect();
-        dx = e.clientX - r.left;
-        dy = e.clientY - r.top;
+        pendingDrag = { startX: e.clientX, startY: e.clientY, dockedAtStart: isDocked };
+        if (!isDocked) {
+            const r = panel.getBoundingClientRect();
+            dx = e.clientX - r.left;
+            dy = e.clientY - r.top;
+        }
     }, true);
     // suppress the click that follows a Ctrl+drag so a Ctrl+click on a button
     // doesn't trigger its action after the drag ends
@@ -911,6 +1159,12 @@ function createPanel() {
         }
     }, true);
     document.addEventListener("mousemove", (e) => {
+        if (pendingDrag) {
+            const adx = Math.abs(e.clientX - pendingDrag.startX);
+            const ady = Math.abs(e.clientY - pendingDrag.startY);
+            if (Math.max(adx, ady) < DRAG_THRESHOLD) return;
+            promoteDrag(e);
+        }
         if (!dragging) return;
         const b = getCanvasBounds();
         const r = panel.getBoundingClientRect();
@@ -918,17 +1172,40 @@ function createPanel() {
         bottomOffset = b.bottom - (e.clientY - dy) - r.height;
         applyOffsets();
     });
-    document.addEventListener("mouseup", () => {
-        if (dragging) {
-            // clamp before persist
-            const c = clampOffsets(rightOffset, bottomOffset);
-            rightOffset = c.ro;
-            bottomOffset = c.bo;
-            applyOffsets();
-            saveState({ rightOffset, bottomOffset });
+    // shared drag-end cleanup so a mouseup off-window (or alt-tab during drag) doesn't
+    // leave pendingDrag armed, pointer-events stuck at "none", or drop zones in the DOM.
+    function endDrag(commit) {
+        pendingDrag = null;
+        if (!dragging) {
+            // pendingDrag-only path (click without movement). No drop zones to clear,
+            // but call clearDropZone defensively in case a stale one slipped through.
+            clearDropZone();
+            return;
         }
-        dragging = false;
-    });
+        const wantDockSide = commit ? dropZoneHoverSide : null;
+        clearDropZone();
+        if (dragSavedPointerEvents !== null) {
+            panel.style.pointerEvents = dragSavedPointerEvents;
+            dragSavedPointerEvents = null;
+        }
+        dragging = false;  // before applyOffsets so it uses the clamped position
+        if (commit) {
+            if (wantDockSide) {
+                dock(wantDockSide);
+            } else {
+                const c = clampOffsets(rightOffset, bottomOffset);
+                rightOffset = c.ro;
+                bottomOffset = c.bo;
+                applyOffsets();
+                saveState({ rightOffset, bottomOffset });
+            }
+        } else {
+            // abort (blur / alt-tab): snap back into bounds visually without persisting
+            applyOffsets();
+        }
+    }
+    document.addEventListener("mouseup", () => endDrag(true));
+    window.addEventListener("blur", () => endDrag(false));
 
     // edge handles: left grows left (right edge anchored), right grows right (left
     // edge anchored via RO ro-delta), bottom grows down (top edge anchored via bo-delta).
@@ -936,6 +1213,7 @@ function createPanel() {
     let edgeDrag = null;
     function makeEdgeHandle(side) {
         const h = document.createElement("div");
+        h.className = "aimdo-edge-handle";
         h.title = "Drag to resize";
         h.style.cssText = `position:absolute;top:28px;bottom:0;${side}:0;width:4px;cursor:ew-resize;z-index:1;`;
         h.addEventListener("mousedown", (e) => {
@@ -966,6 +1244,7 @@ function createPanel() {
     let bottomDrag = null;
     function makeBottomHandle() {
         const h = document.createElement("div");
+        h.className = "aimdo-edge-handle";
         h.title = "Drag to resize";
         // inset from the side handles so corners go to the ew-resize handles
         h.style.cssText = `position:absolute;left:4px;right:4px;bottom:0;height:4px;cursor:ns-resize;z-index:1;`;
@@ -1051,7 +1330,7 @@ function createPanel() {
     });
 
     const MENU_CSS = `
-        display:none; position:fixed; z-index:52;
+        display:none; position:fixed; z-index:1500;
         background:${C.headerBg}; color:${C.text};
         border:1px solid ${C.border}; border-radius:4px;
         padding:2px 0; min-width:120px;
@@ -1072,7 +1351,8 @@ function createPanel() {
     const displaySubmenu = makeMenu();
     const miniSubmenu = makeMenu();
     const themeSubmenu = makeMenu();
-    const allSubmenus = [scaleSubmenu, pollSubmenu, displaySubmenu, miniSubmenu, themeSubmenu];
+    const dockWidthSubmenu = makeMenu();
+    const allSubmenus = [scaleSubmenu, pollSubmenu, displaySubmenu, miniSubmenu, themeSubmenu, dockWidthSubmenu];
     function closeAllSubmenus() { for (const m of allSubmenus) m.style.display = "none"; }
 
     // submenu overlaps parent by 1px so mouse transit doesn't trigger mouseleave-close.
@@ -1120,7 +1400,7 @@ function createPanel() {
     }
 
     // --- Scale submenu
-    const scalePresets = [0.75, 1, 1.25, 1.5, 1.75, 2];
+    const scalePresets = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
     const scaleItems = new Map();
     function renderScaleItems() {
         for (const [s, item] of scaleItems) {
@@ -1167,10 +1447,13 @@ function createPanel() {
         () => colorModelName, v => { colorModelName = v; }, "colorModelName");
     const showLeg = makeToggleItem("Show legends",
         () => showLegends, v => { showLegends = v; }, "showLegends");
+    const showTitleItem = makeToggleItem("Show title",
+        () => showTitle, v => { showTitle = v; }, "showTitle");
     displaySubmenu.appendChild(colorBars.item);
     displaySubmenu.appendChild(colorStroke.item);
     displaySubmenu.appendChild(colorName.item);
     displaySubmenu.appendChild(showLeg.item);
+    displaySubmenu.appendChild(showTitleItem.item);
 
     // --- Mini view submenu
     const showRam = makeToggleItem("RAM",
@@ -1183,11 +1466,26 @@ function createPanel() {
         () => showGpuInMini, v => { showGpuInMini = v; }, "showGpuInMini");
     const showNames = makeToggleItem("Device names",
         () => showHwNames, v => { showHwNames = v; }, "showHwNames");
+    const showNumbers = makeToggleItem("Numbers",
+        () => miniShowNumbers, v => { miniShowNumbers = v; }, "miniShowNumbers");
+    const showUnits = makeToggleItem("Units",
+        () => miniShowUnits, v => { miniShowUnits = v; }, "miniShowUnits");
+    const showType = makeToggleItem("Type labels",
+        () => miniShowType, v => { miniShowType = v; }, "miniShowType");
+    const showGpuTemp = makeToggleItem("GPU temp",
+        () => miniShowGpuTemp, v => { miniShowGpuTemp = v; }, "miniShowGpuTemp");
+    const showGpuPower = makeToggleItem("GPU power",
+        () => miniShowGpuPower, v => { miniShowGpuPower = v; }, "miniShowGpuPower");
     miniSubmenu.appendChild(showRam.item);
     miniSubmenu.appendChild(showVram.item);
     miniSubmenu.appendChild(showCpu.item);
     miniSubmenu.appendChild(showGpu.item);
     miniSubmenu.appendChild(showNames.item);
+    miniSubmenu.appendChild(showType.item);
+    miniSubmenu.appendChild(showNumbers.item);
+    miniSubmenu.appendChild(showUnits.item);
+    miniSubmenu.appendChild(showGpuTemp.item);
+    miniSubmenu.appendChild(showGpuPower.item);
 
     // --- Polling interval submenu (single-select like Scale)
     const pollPresets = [100, 250, 500, 1000, 2000, 5000];
@@ -1244,7 +1542,7 @@ function createPanel() {
                 #aimdo-models::-webkit-scrollbar-thumb:hover { background: ${C.textDim}; }
             `;
         }
-        for (const b of [unloadBtn, resetBtn]) {
+        for (const b of [unloadBtn]) {
             b.style.background = C.btn;
             b.style.color = C.btnText;
         }
@@ -1295,17 +1593,87 @@ function createPanel() {
     }
     renderThemeItems();
 
+    // --- Dock width submenu (section width when docked into the topbar)
+    const dockWidthSliderRow = document.createElement("div");
+    dockWidthSliderRow.style.cssText = `padding:6px 10px;display:flex;flex-direction:column;gap:4px;min-width:180px;`;
+    dockWidthSliderRow.addEventListener("click", (e) => e.stopPropagation());
+    const dockWidthLabel = document.createElement("div");
+    dockWidthLabel.style.cssText = `display:flex;justify-content:space-between;font-size:10px;color:${C.textDim};`;
+    dockWidthLabel.innerHTML = `<span>Section width</span><span class="aimdo-dw-val">${dockSectionWidth}px</span>`;
+    const dockWidthSlider = document.createElement("input");
+    dockWidthSlider.type = "range";
+    dockWidthSlider.min = "60";
+    dockWidthSlider.max = "400";
+    dockWidthSlider.step = "5";
+    dockWidthSlider.value = String(dockSectionWidth);
+    dockWidthSlider.style.cssText = `width:100%;accent-color:${C.vram};cursor:pointer;`;
+    const dockWidthValSpan = dockWidthLabel.querySelector(".aimdo-dw-val");
+    dockWidthSlider.addEventListener("input", () => {
+        dockSectionWidth = parseInt(dockWidthSlider.value, 10);
+        dockWidthValSpan.textContent = dockSectionWidth + "px";
+        applyDockSectionWidth();
+        saveState({ dockSectionWidth });
+    });
+    dockWidthSliderRow.appendChild(dockWidthLabel);
+    dockWidthSliderRow.appendChild(dockWidthSlider);
+    dockWidthSubmenu.appendChild(dockWidthSliderRow);
+    function renderDockWidthItems() {
+        dockWidthSlider.value = String(dockSectionWidth);
+        dockWidthValSpan.textContent = dockSectionWidth + "px";
+    }
+
     // --- Root menu items
     rootMenu.appendChild(makeSubmenuParent("Scale", scaleSubmenu));
     rootMenu.appendChild(makeSubmenuParent("Polling interval", pollSubmenu));
     rootMenu.appendChild(makeSubmenuParent("Display", displaySubmenu));
     rootMenu.appendChild(makeSubmenuParent("Mini view", miniSubmenu));
     rootMenu.appendChild(makeSubmenuParent("Theme", themeSubmenu));
+    rootMenu.appendChild(makeSubmenuParent("Dock width", dockWidthSubmenu));
+
+    // dock / undock toggle — present only when the actionbar is available so we don't
+    // offer a no-op when ComfyUI's new menu is disabled.
+    const dockItem = document.createElement("div");
+    dockItem.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+    dockItem.addEventListener("mouseenter", () => dockItem.style.background = C.btn);
+    dockItem.addEventListener("mouseleave", () => dockItem.style.background = "");
+    function renderDockItem() {
+        const canDock = !!getActionbarContainer();
+        dockItem.style.display = (isDocked || canDock) ? "" : "none";
+        dockItem.innerHTML = `<span style="${CHECK_SLOT}">${isDocked ? "✓" : ""}</span>${isDocked ? "Undock to floating" : "Dock to top"}`;
+    }
+    dockItem.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (isDocked) undock(); else dock();
+        renderDockItem();
+        rootMenu.style.display = "none";
+        closeAllSubmenus();
+    });
+    renderDockItem();
+    rootMenu.appendChild(dockItem);
+
+    // reset peak VRAM marker + clear history graph; this used to live on the header
+    const resetItem = document.createElement("div");
+    resetItem.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
+    resetItem.innerHTML = `<span style="${CHECK_SLOT}"></span>Reset history`;
+    resetItem.title = "Reset peak VRAM marker and clear history graph";
+    resetItem.addEventListener("mouseenter", () => resetItem.style.background = C.btn);
+    resetItem.addEventListener("mouseleave", () => resetItem.style.background = "");
+    resetItem.addEventListener("click", (e) => {
+        e.stopPropagation();
+        resetHistory();
+        rootMenu.style.display = "none";
+        closeAllSubmenus();
+    });
+    rootMenu.appendChild(resetItem);
 
     function renderColorBarsItem() {
-        renderScaleItems(); renderPollItems(); renderThemeItems();
+        renderScaleItems(); renderPollItems(); renderThemeItems(); renderDockWidthItems();
         colorBars.render(); colorStroke.render(); colorName.render(); showLeg.render();
         showRam.render(); showVram.render(); showCpu.render(); showGpu.render(); showNames.render();
+        showTitleItem.render();
+        showType.render(); showNumbers.render(); showUnits.render();
+        showGpuTemp.render(); showGpuPower.render();
+        renderDockItem();
     }
 
     document.body.appendChild(rootMenu);
@@ -1330,6 +1698,20 @@ function createPanel() {
         rootMenu.style.display = "none";
         closeAllSubmenus();
     });
+    // close the docked-expanded body overlay on outside click. body is a DOM child of panel
+    // so panel.contains catches clicks inside the overlay; the popped-out menus live in
+    // document.body, so we whitelist them too — otherwise picking a context-menu item
+    // would also dismiss the overlay the menu was launched from.
+    document.addEventListener("click", (e) => {
+        if (!isDocked || !dockExpanded) return;
+        if (panel.contains(e.target)) return;
+        if (rootMenu.contains(e.target)) return;
+        if (unloadMenu.contains(e.target)) return;
+        for (const m of allSubmenus) if (m.contains(e.target)) return;
+        dockExpanded = false;
+        panel.classList.remove("aimdo-docked-expanded");
+        toggleBtn.textContent = "+";
+    });
     // moving the mouse out of the menu structure into empty space should also
     // close the submenu so it doesn't linger over unrelated UI.
     rootMenu.addEventListener("mouseleave", (e) => {
@@ -1348,6 +1730,24 @@ function createPanel() {
     document.body.appendChild(panel);
     applyOffsets();
 
+    // restore docked placement once ComfyUI has built the topbar. Until the container
+    // exists we wait — the panel sits floating in its persisted spot in the meantime.
+    // Capped at ~3s so a user who disabled the new menu doesn't keep us polling.
+    // Any user-initiated drag or explicit undock during the wait cancels the poll so
+    // we don't yank the panel out from under them.
+    if (isDocked) {
+        isDocked = false;  // dock() guards on this; reset so it actually runs
+        autoDockPending = true;
+        let frames = 0;
+        const tryDock = () => {
+            if (!autoDockPending) return;
+            if (dock(dockSide)) return;
+            if (++frames > 180) { autoDockPending = false; saveState({ docked: false }); return; }
+            requestAnimationFrame(tryDock);
+        };
+        requestAnimationFrame(tryDock);
+    }
+
     // width changes shift ro to anchor one edge (unless suppressed by the left handle).
     // height changes always anchor the top edge by shifting bo by -Δh.
     let lastPanelWidth = null;
@@ -1355,6 +1755,7 @@ function createPanel() {
     if (typeof ResizeObserver !== "undefined") {
         new ResizeObserver(() => {
             if (isPoppedOut()) return;  // PiP resize doesn't persist back to main-page state
+            if (isDocked) { lastPanelWidth = null; lastPanelHeight = null; positionDockedBody(); return; }
             const r = panel.getBoundingClientRect();
             const w = r.width, h = r.height;
             if (lastPanelWidth !== null && w !== lastPanelWidth) {
@@ -1387,7 +1788,7 @@ function createPanel() {
         if (el === observed) return;
         observed = el;
         if (typeof ResizeObserver !== "undefined") {
-            new ResizeObserver(applyOffsets).observe(el);
+            new ResizeObserver(() => { applyOffsets(); positionDockedBody(); }).observe(el);
         }
         applyOffsets();
     }
@@ -1766,6 +2167,7 @@ function renderData(body, data) {
 
     const r = ensureStructure(body);
     const pw = body._panel.getBoundingClientRect().width;
+    body._titleSpan.style.display = showTitle ? "" : "none";
     body._titleSpan.textContent =
         pw >= 320 && data.aimdo_active ? "Memory (aimdo)" :
         pw >= 240 ? "Memory" : "";
@@ -1815,18 +2217,28 @@ function renderData(body, data) {
     const ramOtherPct = (ramOther / ramTotal * 100).toFixed(0);
 
     const mb = body._miniBar;
-    mb.querySelector(".mini-vram-usage").textContent = `${formatBytes(used)} / ${formatBytes(data.total_vram)}`;
+    const _u = miniShowUnits;
+    const _n = miniShowNumbers;
+    mb.querySelector(".mini-vram-usage").textContent = _n
+        ? `${formatBytes(used, _u)} / ${formatBytes(data.total_vram, _u)}`
+        : "";
     mb.querySelector(".mini-vram-bar").innerHTML =
         `<div style="background:${C.vram};height:100%;width:${aimdoPct}%;"></div>` +
         `<div style="background:${C.torch};height:100%;width:${torchPct}%;"></div>` +
         `<div style="background:${C.torchCache};height:100%;width:${torchCachePct}%;"></div>` +
         `<div style="background:${C.other};height:100%;width:${otherPct}%;"></div>`;
-    mb.querySelector(".mini-ram-usage").textContent = `${formatBytes(ramUsed)} / ${formatBytes(ramTotal)}`;
+    mb.querySelector(".mini-ram-usage").textContent = _n
+        ? `${formatBytes(ramUsed, _u)} / ${formatBytes(ramTotal, _u)}`
+        : "";
     mb.querySelector(".mini-ram-bar").innerHTML =
         `<div style="background:${C.pinned};height:100%;width:${pinnedRamPct}%;"></div>` +
         `<div style="background:${C.loadedRam};height:100%;width:${loadedRamPct}%;"></div>` +
         `<div style="background:${C.python};height:100%;width:${pythonOtherPct}%;"></div>` +
         `<div style="background:${C.other};height:100%;width:${ramOtherPct}%;"></div>`;
+
+    // toggleable "Type" label hides RAM / VRAM / CPU / GPU prefixes (plus any device suffix)
+    mb.querySelector(".mini-ram-label").style.display = miniShowType ? "" : "none";
+    mb.querySelector(".mini-vram-label").style.display = miniShowType ? "" : "none";
 
     mb.querySelector(".mini-ram-section").style.display = showRamInMini ? "" : "none";
     mb.querySelector(".mini-vram-section").style.display = showVramInMini ? "" : "none";
@@ -1835,14 +2247,16 @@ function renderData(body, data) {
         cpuSection.style.display = "";
         const cpuColor = gpuUtilColor(data.cpu_util);
         const cpuPct = Math.round(data.cpu_util);
-        mb.querySelector(".mini-cpu-usage").innerHTML =
-            `<span style="color:${cpuColor};">${(cpuPct < 10 ? "0" : "") + cpuPct}%</span>`;
+        mb.querySelector(".mini-cpu-usage").innerHTML = _n
+            ? `<span style="color:${cpuColor};">${(cpuPct < 10 ? "0" : "") + cpuPct}${_u ? "%" : ""}</span>`
+            : "";
         const cpuFill = mb.querySelector(".mini-cpu-fill");
         cpuFill.style.background = cpuColor;
         cpuFill.style.width = `${cpuPct}%`;
         const cpuLabel = mb.querySelector(".mini-cpu-label");
         cpuLabel.textContent = (showHwNames && data.cpu_name) ? `CPU (${shortenCpuName(data.cpu_name)})` : "CPU";
         cpuLabel.title = data.cpu_name || "";
+        cpuLabel.style.display = miniShowType ? "" : "none";
     } else {
         cpuSection.style.display = "none";
     }
@@ -1850,27 +2264,31 @@ function renderData(body, data) {
     if (data.gpu_util != null && showGpuInMini) {
         gpuSection.style.display = "";
         const gpuColor = gpuUtilColor(data.gpu_util);
-        const pctStr = (data.gpu_util < 10 ? "0" : "") + data.gpu_util + "%";
-        const tempStr = data.gpu_temp != null
-            ? ` <span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}&deg;C</span>`
-            : "";
-        const powerStr = data.gpu_power != null && data.gpu_power_limit != null
-            ? ` <span style="color:${gpuPowerColor(data.gpu_power, data.gpu_power_limit)};">${formatPower(data.gpu_power, data.gpu_power_limit)}</span>`
-            : "";
-        mb.querySelector(".mini-gpu-usage").innerHTML =
-            `<span style="color:${gpuColor};">${pctStr}</span>${tempStr}${powerStr}`;
+        let gpuHtml = "";
+        if (_n) {
+            const pctStr = (data.gpu_util < 10 ? "0" : "") + data.gpu_util + (_u ? "%" : "");
+            gpuHtml = `<span style="color:${gpuColor};">${pctStr}</span>`;
+            if (data.gpu_temp != null && miniShowGpuTemp) {
+                gpuHtml += ` <span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}${_u ? "&deg;C" : ""}</span>`;
+            }
+            if (data.gpu_power != null && data.gpu_power_limit != null && miniShowGpuPower) {
+                gpuHtml += ` <span style="color:${gpuPowerColor(data.gpu_power, data.gpu_power_limit)};">${formatPower(data.gpu_power, data.gpu_power_limit, _u)}</span>`;
+            }
+        }
+        mb.querySelector(".mini-gpu-usage").innerHTML = gpuHtml;
         const gpuFill = mb.querySelector(".mini-gpu-fill");
         gpuFill.style.background = gpuColor;
         gpuFill.style.width = `${data.gpu_util}%`;
         const gpuLabel = mb.querySelector(".mini-gpu-label");
         gpuLabel.textContent = (showHwNames && data.gpu_name) ? `GPU (${shortenGpuName(data.gpu_name)})` : "GPU";
         gpuLabel.title = data.gpu_name || "";
+        gpuLabel.style.display = miniShowType ? "" : "none";
     } else {
         gpuSection.style.display = "none";
     }
 
     r.contentDiv.innerHTML = `<div style="margin-bottom:4px;">
-        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
             <span>RAM</span>
             <span>${formatBytes(ramUsed)} / ${formatBytes(ramTotal)}</span>
         </div>
@@ -1888,7 +2306,7 @@ function renderData(body, data) {
         </div>` : ""}
     </div>
     <div style="margin-bottom:4px;">
-        <div style="display:flex;justify-content:space-between;margin-bottom:2px;">
+        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
             <span title="${escHtml(data.gpu_name || "")}">VRAM${(showHwNames && data.gpu_name) ? ` (${escHtml(shortenGpuName(data.gpu_name))})` : ""}</span>
             <span>${formatBytes(used)} / ${formatBytes(data.total_vram)}</span>
         </div>
