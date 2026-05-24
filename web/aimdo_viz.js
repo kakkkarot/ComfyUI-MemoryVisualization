@@ -1,4 +1,4 @@
-import { app } from "../../scripts/app.js";
+	import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 let pollInterval = 500;
@@ -46,7 +46,7 @@ function saveState(patch) {
 // <html> — CSS does the rest. JS keeps a parallel `C` palette object only
 // because <canvas> can't read CSS variables; canvas rendering reads hex/rgb
 // strings from C, which we refresh from computed CSS on each theme switch.
-const THEME_NAMES = ["default", "light", "sepia", "fallout", "pink"];
+const THEME_NAMES = ["default", "light", "sepia", "fallout", "pink", "lucifer"];
 
 // Keys whose values are color strings the canvas can read directly. fadeOutFrom /
 // fadeOutTo are stored as comma-separated RGB triplets in CSS and parsed into
