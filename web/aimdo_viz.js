@@ -1,6 +1,5 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { THEMES } from "./themes.js";
 
 let pollInterval = 500;
 const FADE_TICKS = 6;
@@ -41,23 +40,74 @@ function saveState(patch) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
 }
 
-// live palette + model-type colors; mutated by applyPalette on theme switches.
-// THEMES.default is the source of truth — see themes.js.
-const C = { ...THEMES.default.palette };
-const MODEL_TYPE_COLOR = { ...THEMES.default.modelTypes };
+// Themes live in aimdo_viz.css as `[data-aimdo-theme="<name>"]` blocks layered
+// over a :root default. Selecting a theme is just setting that attribute on
+// <html> — CSS does the rest. JS keeps a parallel `C` palette object only
+// because <canvas> can't read CSS variables; canvas rendering reads hex/rgb
+// strings from C, which we refresh from computed CSS on each theme switch.
+const THEME_NAMES = ["default", "light", "sepia", "fallout", "pink"];
 
-// frozen baseline so applyPalette can reset cleanly before merging overrides.
-const DEFAULT_C = Object.freeze({ ...THEMES.default.palette });
-const DEFAULT_TYPES = Object.freeze({ ...THEMES.default.modelTypes });
+// Keys whose values are color strings the canvas can read directly. fadeOutFrom /
+// fadeOutTo are stored as comma-separated RGB triplets in CSS and parsed into
+// [r,g,b] arrays for the canvas fade animation.
+const PALETTE_KEYS = Object.freeze([
+    "vram","torch","pinned","loadedRam","unloaded","torchCache","python","other",
+    "text","textDim","running","bg","rowBg","headerBg","border","btn","btnText",
+    "graphBg","gridLine","totalLine","gpuUtil","gpuUtilHi","capLine","barBg",
+]);
+const MODEL_TYPE_KEYS = Object.freeze([
+    "model","vae","clip","clip_vision","controlnet","style_model","gligen","upscale_model",
+]);
+const RGB_KEYS = Object.freeze(["fadeOutFrom", "fadeOutTo"]);
 
-// palette-only swap (no DOM); called at init before elements exist.
+// Filled by applyPalette() from computed CSS once the stylesheet is loaded.
+// Canvas drawing reads from here because <canvas> can't read CSS variables;
+// the DOM reads var(--aimdo-X) directly from CSS and never touches C.
+const C = {};
+const MODEL_TYPE_COLOR = {};
+
+// Load the stylesheet and expose the load as a promise. Init code awaits this
+// before touching C so the canvas never draws against an unpopulated palette.
+const cssLoaded = new Promise((resolve) => {
+    const id = "aimdo-viz-stylesheet";
+    if (document.getElementById(id)) { resolve(); return; }
+    const link = document.createElement("link");
+    link.id = id;
+    link.rel = "stylesheet";
+    link.href = new URL("aimdo_viz.css", import.meta.url).href;
+    link.addEventListener("load", () => resolve(), { once: true });
+    link.addEventListener("error", () => resolve(), { once: true });  // proceed even on 404
+    document.head.appendChild(link);
+});
+
+function parseRgbTriplet(s) {
+    const parts = s.split(",").map(x => parseInt(x.trim(), 10));
+    if (parts.length === 3 && parts.every(Number.isFinite)) return parts;
+    return null;
+}
+
+// Set the theme on <html> so the matching CSS block takes effect, then
+// refresh C from computed CSS variables for canvas use.
 function applyPalette(name) {
-    Object.assign(C, DEFAULT_C);
-    Object.assign(MODEL_TYPE_COLOR, DEFAULT_TYPES);
-    const t = THEMES[name];
-    if (t) {
-        Object.assign(C, t.palette || {});
-        Object.assign(MODEL_TYPE_COLOR, t.modelTypes || {});
+    const root = document.documentElement;
+    if (name && name !== "default" && THEME_NAMES.includes(name)) {
+        root.dataset.aimdoTheme = name;
+    } else {
+        delete root.dataset.aimdoTheme;
+    }
+    const cs = getComputedStyle(root);
+    for (const k of PALETTE_KEYS) {
+        const v = cs.getPropertyValue(`--aimdo-${k}`).trim();
+        if (v) C[k] = v;
+    }
+    for (const k of MODEL_TYPE_KEYS) {
+        const v = cs.getPropertyValue(`--aimdo-type-${k}`).trim();
+        if (v) MODEL_TYPE_COLOR[k] = v;
+    }
+    for (const k of RGB_KEYS) {
+        const v = cs.getPropertyValue(`--aimdo-${k}`).trim();
+        const rgb = v && parseRgbTriplet(v);
+        if (rgb) C[k] = rgb;
     }
 }
 
@@ -455,7 +505,7 @@ function drawPageGrid(ctx, cssW, residency, changeAge, panelScale, vramColor) {
     // skip draw when nothing's animating and inputs match the previous call.
     let anyAnimating = false;
     for (let i = 0; i < changeAge.length; i++) if (changeAge[i] > 0) { anyAnimating = true; break; }
-    const sig = `${vramHex}|${C.unloaded}|${backingW}x${backingH}|${residency.length}`;
+    const sig = `${vramHex}|var(--aimdo-unloaded)|${backingW}x${backingH}|${residency.length}`;
     if (!anyAnimating && canvas._lastSig === sig) return;
     canvas._lastSig = sig;
 
@@ -512,93 +562,18 @@ function createPanel() {
     if (typeof saved.miniShowGpuTemp === "boolean") miniShowGpuTemp = saved.miniShowGpuTemp;
     if (typeof saved.miniShowGpuPower === "boolean") miniShowGpuPower = saved.miniShowGpuPower;
     if (typeof saved.graphHeight === "number" && saved.graphHeight > 0) graphHeight = saved.graphHeight;
-    if (typeof saved.theme === "string" && THEMES[saved.theme]) {
+    if (typeof saved.theme === "string" && THEME_NAMES.includes(saved.theme)) {
         currentTheme = saved.theme;
-        applyPalette(currentTheme);
     }
+    // always run — primes C from computed CSS so the canvas matches the stylesheet
+    applyPalette(currentTheme);
     if (saved.modelCollapsed && typeof saved.modelCollapsed === "object") modelCollapsed = saved.modelCollapsed;
     let panelScale = typeof saved.scale === "number" ? saved.scale : 1;
 
-    // injected once; guarded against duplicate re-init.
-    if (!document.getElementById("aimdo-viz-style")) {
-        const s = document.createElement("style");
-        s.id = "aimdo-viz-style";
-        s.textContent = `
-            #aimdo-models { scrollbar-width: thin; scrollbar-color: ${C.btn} transparent; }
-            #aimdo-models::-webkit-scrollbar { width: 8px; }
-            #aimdo-models::-webkit-scrollbar-track { background: transparent; }
-            #aimdo-models::-webkit-scrollbar-thumb { background: ${C.btn}; border-radius: 4px; }
-            #aimdo-models::-webkit-scrollbar-thumb:hover { background: ${C.textDim}; }
-
-            /* docked mode: flatten the panel into a horizontal row that fits the actionbar */
-            #aimdo-viz-panel.aimdo-docked {
-                position: static !important;
-                left: auto !important; top: auto !important; right: auto !important; bottom: auto !important;
-                width: auto !important; height: auto !important;
-                min-width: 0 !important; max-width: none !important; max-height: none !important;
-                border: none !important; border-radius: 0 !important;
-                box-shadow: none !important; background: transparent !important;
-                flex-direction: row !important; align-items: center;
-                zoom: 1 !important;
-            }
-            #aimdo-viz-panel.aimdo-docked .aimdo-header {
-                padding: 2px 8px !important; background: transparent !important;
-                border-radius: 0 !important; flex-shrink: 0;
-            }
-            #aimdo-viz-panel.aimdo-docked .aimdo-mini-bar {
-                display: flex !important; flex-direction: row !important;
-                padding: 0 !important; gap: 12px; align-items: center;
-                flex: 1 1 auto; min-width: 0;
-            }
-            #aimdo-viz-panel.aimdo-docked .aimdo-mini-bar > * {
-                width: var(--aimdo-dock-section-w, 110px);
-                min-width: var(--aimdo-dock-section-w, 110px);
-                flex: 0 0 auto;
-            }
-            #aimdo-viz-panel.aimdo-docked #aimdo-viz-body { display: none !important; }
-            #aimdo-viz-panel.aimdo-docked.aimdo-docked-expanded #aimdo-viz-body {
-                display: flex !important;
-                position: fixed !important;
-                z-index: 1500;
-                width: 340px; max-height: 60vh;
-                background: ${C.bg}; color: ${C.text};
-                border: 1px solid ${C.border}; border-radius: 6px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.7);
-            }
-            #aimdo-viz-panel.aimdo-docked .aimdo-edge-handle,
-            #aimdo-viz-panel.aimdo-docked .aimdo-corner-handle { display: none !important; }
-
-            /* drop zone shown next to the actionbar items during a drag */
-            .aimdo-dropzone {
-                position: relative; z-index: 1501;
-                order: -1; align-self: stretch; margin: 6px;
-                padding: 0 12px; display: flex; align-items: center; justify-content: center;
-                font-family: monospace; font-size: 11px;
-                border: 2px dashed #3b82f6; border-radius: 6px;
-                background: rgba(59,130,246,0.4); color: #fff;
-                pointer-events: auto; min-width: 160px;
-                opacity: 0.9;
-                transition: transform 0.12s, opacity 0.12s, box-shadow 0.12s, border-width 0.12s;
-            }
-            .aimdo-dropzone.is-hover {
-                opacity: 1; transform: scale(1.04);
-                border-width: 3px; box-shadow: 0 0 20px rgba(59,130,246,0.45);
-            }
-        `;
-        document.head.appendChild(s);
-    }
-
+    // structural styles live in aimdo_viz.css; CSS variables on :root carry the palette.
+    // theme switches go through applyPalette → setCssVars; no per-element repaint here.
     const panel = document.createElement("div");
     panel.id = "aimdo-viz-panel";
-    panel.style.cssText = `
-        position: fixed;
-        background: ${C.bg}; color: ${C.text};
-        border: 1px solid ${C.border}; border-radius: 8px;
-        padding: 0; font-family: monospace; font-size: 12px;
-        z-index: 50; min-width: 200px; width: 340px; max-width: 100vw;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.7);
-        user-select: none; display: flex; flex-direction: column;
-    `;
     panel.style.zoom = panelScale;
     panel._scale = panelScale;
     if (saved.width != null) panel.style.width = Math.min(saved.width, window.innerWidth) / panelScale + "px";
@@ -785,9 +760,8 @@ function createPanel() {
     // which side to dock on via CSS order on the panel.
     function makeDropZone(side) {
         const dz = document.createElement("div");
-        dz.className = "aimdo-dropzone";
+        dz.className = "aimdo-dropzone aimdo-dropzone-" + side;
         dz.textContent = "Dock " + side;
-        dz.style.order = side === "left" ? "-2" : "2";
         dz.addEventListener("mouseenter", () => {
             if (!dragging) return;
             dropZoneHoverSide = side;
@@ -877,61 +851,60 @@ function createPanel() {
 
     const header = document.createElement("div");
     header.className = "aimdo-header";
-    header.style.cssText = `
-        display: flex; justify-content: space-between; align-items: center;
-        padding: 6px 10px; background: ${C.headerBg};
-        border-radius: 8px 8px 0 0; cursor: move;
-    `;
     const titleSpan = document.createElement("span");
-    titleSpan.style.cssText = `font-weight:bold;color:${C.text};white-space:nowrap;`;
+    titleSpan.className = "aimdo-title";
     titleSpan.textContent = "Memory";
     header.appendChild(titleSpan);
 
     const miniBar = document.createElement("div");
     miniBar.className = "aimdo-mini-bar";
-    miniBar.style.cssText = `display:none;padding:4px 10px 6px;font-size:10px;color:${C.textDim};`;
     miniBar.innerHTML = `<div class="mini-ram-section">
-        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
+        <div class="aimdo-mini-row">
             <span class="mini-ram-label">RAM</span><span class="mini-ram-usage"></span>
         </div>
-        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-ram-bar"></div>
+        <div class="aimdo-mini-track mini-ram-bar"></div>
     </div>
     <div class="mini-vram-section">
-        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
+        <div class="aimdo-mini-row">
             <span class="mini-vram-label">VRAM</span><span class="mini-vram-usage"></span>
         </div>
-        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-vram-bar"></div>
+        <div class="aimdo-mini-track mini-vram-bar"></div>
     </div>
     <div class="mini-cpu-section">
-        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;">
+        <div class="aimdo-mini-row">
             <span class="mini-cpu-label">CPU</span><span class="mini-cpu-usage"></span>
         </div>
-        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;margin-bottom:4px;" class="mini-cpu-bar"><div class="mini-cpu-fill" style="height:100%;width:0;transition:width 0.35s ease-out,background 0.35s ease-out;"></div></div>
+        <div class="aimdo-mini-track mini-cpu-bar"><div class="aimdo-mini-fill mini-cpu-fill"></div></div>
     </div>
     <div class="mini-gpu-section">
-        <div style="display:flex;justify-content:space-between;gap:6px;margin-bottom:2px;" class="mini-gpu-row">
-            <span class="mini-gpu-label">GPU</span><span class="mini-gpu-usage"></span>
+        <div class="aimdo-mini-row mini-gpu-row">
+            <span class="mini-gpu-label">GPU</span><span class="mini-gpu-header-value"></span>
         </div>
-        <div style="background:${C.barBg};border-radius:2px;height:4px;overflow:hidden;display:flex;" class="mini-gpu-bar"><div class="mini-gpu-fill" style="height:100%;width:0;transition:width 0.35s ease-out,background 0.35s ease-out;"></div></div>
+        <div class="aimdo-mini-inline mini-util-row">
+            <div class="aimdo-mini-track mini-gpu-bar"><div class="aimdo-mini-fill mini-gpu-fill"></div></div>
+            <span class="mini-gpu-usage"></span>
+        </div>
+        <div class="aimdo-mini-inline mini-temp-row">
+            <div class="aimdo-mini-track mini-temp-bar"><div class="aimdo-mini-fill mini-temp-fill"></div></div>
+            <span class="mini-temp-usage"></span>
+        </div>
+        <div class="aimdo-mini-inline mini-power-row">
+            <div class="aimdo-mini-track mini-power-bar"><div class="aimdo-mini-fill mini-power-fill"></div></div>
+            <span class="mini-power-usage"></span>
+        </div>
     </div>`;
 
     const headerRight = document.createElement("div");
-    headerRight.style.cssText = "display:flex;align-items:center;gap:6px;";
+    headerRight.className = "aimdo-header-right";
 
     const unloadBtn = document.createElement("span");
+    unloadBtn.className = "aimdo-btn";
     unloadBtn.textContent = "unload ▾";
     unloadBtn.title = "Unload models / free cache (click for options)";
-    unloadBtn.style.cssText = `cursor:pointer;font-size:10px;padding:1px 6px;background:${C.btn};border-radius:3px;color:${C.btnText};white-space:nowrap;`;
 
     const unloadMenu = document.createElement("div");
-    unloadMenu.style.cssText = `
-        display:none; position:fixed; z-index:1500;
-        background:${C.headerBg}; color:${C.text};
-        border:1px solid ${C.border}; border-radius:4px;
-        padding:2px 0; min-width:160px;
-        box-shadow:0 4px 12px rgba(0,0,0,0.7);
-        font-family:monospace; font-size:10px;
-    `;
+    unloadMenu.className = "aimdo-menu";
+    unloadMenu.style.minWidth = "160px";
     const unloadOptions = [
         { label: "aimdo (immediate)", title: "Immediately unload aimdo-managed models", run: () =>
             api.fetchApi("/aimdo/unload_all", { method: "POST" }) },
@@ -946,11 +919,9 @@ function createPanel() {
     ];
     for (const opt of unloadOptions) {
         const item = document.createElement("div");
+        item.className = "aimdo-menu-item";
         item.textContent = opt.label;
         item.title = opt.title;
-        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-        item.addEventListener("mouseenter", () => item.style.background = C.btn);
-        item.addEventListener("mouseleave", () => item.style.background = "");
         item.addEventListener("click", async (e) => {
             e.stopPropagation();
             unloadMenu.style.display = "none";
@@ -997,9 +968,10 @@ function createPanel() {
     }
 
     const popoutBtn = document.createElement("span");
+    popoutBtn.className = "aimdo-btn-icon";
+    popoutBtn.style.fontSize = "12px";
     popoutBtn.textContent = "\u2924";
     popoutBtn.title = "Pop out into a Picture-in-Picture window";
-    popoutBtn.style.cssText = `cursor:pointer;font-size:12px;padding:0 4px;color:${C.btnText};`;
     popoutBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
         if (pipWindow && !pipWindow.closed) { pipWindow.close(); return; }
@@ -1014,9 +986,22 @@ function createPanel() {
             width: Math.max(280, Math.round(r.width)),
             height: Math.max(200, Math.round(r.height)),
         });
-        // copy the injected scrollbar stylesheet so #aimdo-models scrolls right
-        const styleSrc = document.getElementById("aimdo-viz-style");
-        if (styleSrc) pipWindow.document.head.appendChild(styleSrc.cloneNode(true));
+        // mirror the stylesheet into the PiP window. Wait for the cloned <link> to finish
+        // loading before continuing, otherwise the panel briefly renders unstyled while the
+        // CSS file is being fetched in the PiP document.
+        const styleSrc = document.getElementById("aimdo-viz-stylesheet");
+        if (styleSrc) {
+            const clone = styleSrc.cloneNode(true);
+            await new Promise((resolve) => {
+                clone.addEventListener("load", resolve, { once: true });
+                clone.addEventListener("error", resolve, { once: true });  // proceed anyway after a 404
+                pipWindow.document.head.appendChild(clone);
+            });
+        }
+        // mirror the active theme onto PiP's <html> — the cloned stylesheet contains
+        // every theme's overrides, the data attribute picks which block applies
+        const themeAttr = document.documentElement.dataset.aimdoTheme;
+        if (themeAttr) pipWindow.document.documentElement.dataset.aimdoTheme = themeAttr;
         // remember origins so we can restore on close
         const moved = [];
         const remember = el => moved.push({ el, parent: el.parentNode, next: el.nextSibling });
@@ -1045,13 +1030,13 @@ function createPanel() {
     });
 
     const toggleBtn = document.createElement("span");
+    toggleBtn.className = "aimdo-btn-icon";
+    toggleBtn.style.fontSize = "16px";
     toggleBtn.textContent = "\u2212";
     toggleBtn.title = "Collapse / expand panel";
-    toggleBtn.style.cssText = `cursor:pointer;font-size:16px;padding:0 4px;color:${C.btnText};`;
 
     const body = document.createElement("div");
     body.id = "aimdo-viz-body";
-    body.style.cssText = "padding: 8px 10px; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden;";
 
     let collapsed = !!saved.collapsed;
     if (collapsed) {
@@ -1213,9 +1198,8 @@ function createPanel() {
     let edgeDrag = null;
     function makeEdgeHandle(side) {
         const h = document.createElement("div");
-        h.className = "aimdo-edge-handle";
+        h.className = `aimdo-edge-handle aimdo-edge-${side}`;
         h.title = "Drag to resize";
-        h.style.cssText = `position:absolute;top:28px;bottom:0;${side}:0;width:4px;cursor:ew-resize;z-index:1;`;
         h.addEventListener("mousedown", (e) => {
             if (e.button !== 0) return;
             e.preventDefault();
@@ -1244,10 +1228,9 @@ function createPanel() {
     let bottomDrag = null;
     function makeBottomHandle() {
         const h = document.createElement("div");
-        h.className = "aimdo-edge-handle";
-        h.title = "Drag to resize";
         // inset from the side handles so corners go to the ew-resize handles
-        h.style.cssText = `position:absolute;left:4px;right:4px;bottom:0;height:4px;cursor:ns-resize;z-index:1;`;
+        h.className = "aimdo-edge-handle aimdo-edge-bottom";
+        h.title = "Drag to resize";
         h.addEventListener("mousedown", (e) => {
             if (e.button !== 0) return;
             e.preventDefault();
@@ -1261,23 +1244,13 @@ function createPanel() {
     }
     makeBottomHandle();
 
-    // bottom-right corner handle: diagonal width+height drag with visible grip.
+    // bottom-right corner handle: diagonal width+height drag. The grip gradient + hover
+    // opacity live in aimdo_viz.css now.
     let cornerDrag = null;
-    function cornerGripBg() {
-        return `linear-gradient(135deg,
-            transparent 50%,
-            ${C.textDim} 50%, ${C.textDim} 60%,
-            transparent 60%, transparent 75%,
-            ${C.textDim} 75%, ${C.textDim} 85%,
-            transparent 85%)`;
-    }
     function makeCornerHandle() {
         const h = document.createElement("div");
-        h.title = "Drag to resize";
         h.className = "aimdo-corner-handle";
-        h.style.cssText = `position:absolute;right:0;bottom:0;width:12px;height:12px;cursor:nwse-resize;z-index:2;background:${cornerGripBg()};border-bottom-right-radius:4px;opacity:0.55;`;
-        h.addEventListener("mouseenter", () => h.style.opacity = "1");
-        h.addEventListener("mouseleave", () => h.style.opacity = "0.55");
+        h.title = "Drag to resize";
         h.addEventListener("mousedown", (e) => {
             if (e.button !== 0) return;
             e.preventDefault();
@@ -1329,20 +1302,11 @@ function createPanel() {
         if (cornerDrag) cornerDrag = null;
     });
 
-    const MENU_CSS = `
-        display:none; position:fixed; z-index:1500;
-        background:${C.headerBg}; color:${C.text};
-        border:1px solid ${C.border}; border-radius:4px;
-        padding:2px 0; min-width:120px;
-        box-shadow:0 4px 12px rgba(0,0,0,0.7);
-        font-family:monospace; font-size:10px;
-    `;
-    // fixed-width span keeps width stable when items toggle the checkmark on/off.
-    const CHECK_SLOT = `display:inline-block;width:12px;text-align:center;`;
-
+    // menu chrome lives in aimdo_viz.css (.aimdo-menu). Submenus differ only by
+    // position which we set inline at openSubmenu time.
     function makeMenu() {
         const m = document.createElement("div");
-        m.style.cssText = MENU_CSS;
+        m.className = "aimdo-menu";
         return m;
     }
     const rootMenu = makeMenu();
@@ -1352,19 +1316,27 @@ function createPanel() {
     const miniSubmenu = makeMenu();
     const themeSubmenu = makeMenu();
     const dockWidthSubmenu = makeMenu();
-    const allSubmenus = [scaleSubmenu, pollSubmenu, displaySubmenu, miniSubmenu, themeSubmenu, dockWidthSubmenu];
+    const gpuSubmenu = makeMenu();
+    const allSubmenus = [scaleSubmenu, pollSubmenu, displaySubmenu, miniSubmenu, themeSubmenu, dockWidthSubmenu, gpuSubmenu];
     function closeAllSubmenus() { for (const m of allSubmenus) m.style.display = "none"; }
 
     // submenu overlaps parent by 1px so mouse transit doesn't trigger mouseleave-close.
-    function openSubmenu(parentItem, submenu) {
-        closeAllSubmenus();
+    // anchorMenu defaults to rootMenu (top-level submenus) but can be another submenu
+    // for nested cases; keepOpen lists ancestors that must NOT be closed when this opens.
+    function openSubmenu(parentItem, submenu, anchorMenu, keepOpen) {
+        anchorMenu = anchorMenu || rootMenu;
+        keepOpen = keepOpen || [];
+        for (const m of allSubmenus) {
+            if (m === submenu || keepOpen.includes(m)) continue;
+            m.style.display = "none";
+        }
         submenu.style.zoom = panelScale;
         submenu.style.display = "block";
-        const rootR = rootMenu.getBoundingClientRect();
+        const anchorR = anchorMenu.getBoundingClientRect();
         const itemR = parentItem.getBoundingClientRect();
         const subR = submenu.getBoundingClientRect();
-        let left = rootR.right - 1;
-        if (left + subR.width > window.innerWidth) left = Math.max(2, rootR.left - subR.width + 1);
+        let left = anchorR.right - 1;
+        if (left + subR.width > window.innerWidth) left = Math.max(2, anchorR.left - subR.width + 1);
         submenu.style.left = (left / panelScale) + "px";
         submenu.style.top = (Math.min(itemR.top, window.innerHeight - subR.height - 4) / panelScale) + "px";
     }
@@ -1372,15 +1344,14 @@ function createPanel() {
     // factory for a checkbox-style toggle item bound to a module-level flag.
     function makeToggleItem(label, getValue, setValue, stateKey) {
         const item = document.createElement("div");
-        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-        item.addEventListener("mouseenter", () => item.style.background = C.btn);
-        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.className = "aimdo-menu-item";
         const render = () => {
-            item.innerHTML = `<span style="${CHECK_SLOT}">${getValue() ? "✓" : ""}</span>${label}`;
+            item.innerHTML = `<span class="aimdo-check">${getValue() ? "✓" : ""}</span>${label}`;
         };
         render();
         item.addEventListener("click", (e) => {
             e.stopPropagation();
+            if (item.classList.contains("is-disabled")) return;
             setValue(!getValue());
             saveState({ [stateKey]: getValue() });
             render();
@@ -1390,12 +1361,11 @@ function createPanel() {
     }
 
     // parent item that opens a submenu on hover; chevron hints at the nesting.
-    function makeSubmenuParent(label, submenu) {
+    function makeSubmenuParent(label, submenu, anchorMenu, keepOpen) {
         const item = document.createElement("div");
-        item.style.cssText = `padding:4px 10px;cursor:default;white-space:nowrap;display:flex;justify-content:space-between;gap:12px;`;
-        item.innerHTML = `<span>${label}</span><span class="aimdo-chevron" style="color:${C.textDim};">▸</span>`;
-        item.addEventListener("mouseenter", () => { item.style.background = C.btn; openSubmenu(item, submenu); });
-        item.addEventListener("mouseleave", () => { item.style.background = ""; });
+        item.className = "aimdo-menu-parent";
+        item.innerHTML = `<span>${label}</span><span class="aimdo-chevron">▸</span>`;
+        item.addEventListener("mouseenter", () => openSubmenu(item, submenu, anchorMenu, keepOpen));
         return item;
     }
 
@@ -1405,7 +1375,7 @@ function createPanel() {
     function renderScaleItems() {
         for (const [s, item] of scaleItems) {
             const on = Math.abs(s - panelScale) < 1e-6;
-            item.innerHTML = `<span style="${CHECK_SLOT}">${on ? "✓" : ""}</span>${Math.round(s * 100)}%`;
+            item.innerHTML = `<span class="aimdo-check">${on ? "✓" : ""}</span>${Math.round(s * 100)}%`;
         }
     }
     function setScale(s) {
@@ -1423,9 +1393,7 @@ function createPanel() {
     }
     for (const s of scalePresets) {
         const item = document.createElement("div");
-        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-        item.addEventListener("mouseenter", () => item.style.background = C.btn);
-        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.className = "aimdo-menu-item";
         item.addEventListener("click", (e) => {
             e.stopPropagation();
             setScale(s);
@@ -1462,7 +1430,8 @@ function createPanel() {
         () => showVramInMini, v => { showVramInMini = v; }, "showVramInMini");
     const showCpu = makeToggleItem("CPU",
         () => showCpuInMini, v => { showCpuInMini = v; }, "showCpuInMini");
-    const showGpu = makeToggleItem("GPU",
+    // labeled "util" since these live under the nested GPU submenu now
+    const showGpu = makeToggleItem("util",
         () => showGpuInMini, v => { showGpuInMini = v; }, "showGpuInMini");
     const showNames = makeToggleItem("Device names",
         () => showHwNames, v => { showHwNames = v; }, "showHwNames");
@@ -1472,20 +1441,24 @@ function createPanel() {
         () => miniShowUnits, v => { miniShowUnits = v; }, "miniShowUnits");
     const showType = makeToggleItem("Type labels",
         () => miniShowType, v => { miniShowType = v; }, "miniShowType");
-    const showGpuTemp = makeToggleItem("GPU temp",
+    const showGpuTemp = makeToggleItem("temp",
         () => miniShowGpuTemp, v => { miniShowGpuTemp = v; }, "miniShowGpuTemp");
-    const showGpuPower = makeToggleItem("GPU power",
+    const showGpuPower = makeToggleItem("power",
         () => miniShowGpuPower, v => { miniShowGpuPower = v; }, "miniShowGpuPower");
     miniSubmenu.appendChild(showRam.item);
     miniSubmenu.appendChild(showVram.item);
     miniSubmenu.appendChild(showCpu.item);
-    miniSubmenu.appendChild(showGpu.item);
+    // GPU's util / temp / power get their own submenu since they're closely related —
+    // keeps the Mini-view list flat and groups the three multibar toggles together.
+    // Each is independent: any combination can be on/off, including just temp+power.
+    gpuSubmenu.appendChild(showGpu.item);
+    gpuSubmenu.appendChild(showGpuTemp.item);
+    gpuSubmenu.appendChild(showGpuPower.item);
+    miniSubmenu.appendChild(makeSubmenuParent("GPU", gpuSubmenu, miniSubmenu, [miniSubmenu]));
     miniSubmenu.appendChild(showNames.item);
     miniSubmenu.appendChild(showType.item);
     miniSubmenu.appendChild(showNumbers.item);
     miniSubmenu.appendChild(showUnits.item);
-    miniSubmenu.appendChild(showGpuTemp.item);
-    miniSubmenu.appendChild(showGpuPower.item);
 
     // --- Polling interval submenu (single-select like Scale)
     const pollPresets = [100, 250, 500, 1000, 2000, 5000];
@@ -1494,14 +1467,12 @@ function createPanel() {
         for (const [ms, item] of pollItems) {
             const on = ms === pollInterval;
             const label = ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
-            item.innerHTML = `<span style="${CHECK_SLOT}">${on ? "✓" : ""}</span>${label}`;
+            item.innerHTML = `<span class="aimdo-check">${on ? "✓" : ""}</span>${label}`;
         }
     }
     for (const ms of pollPresets) {
         const item = document.createElement("div");
-        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-        item.addEventListener("mouseenter", () => item.style.background = C.btn);
-        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.className = "aimdo-menu-item";
         item.addEventListener("click", (e) => {
             e.stopPropagation();
             pollInterval = ms;
@@ -1516,52 +1487,14 @@ function createPanel() {
     renderPollItems();
 
     // --- Theme submenu (single-select; live-applies)
+    // applyPalette pushes the active palette into CSS variables on :root, so
+    // most chrome repaints itself. We only need to manually clear places that
+    // bake colors into innerHTML / canvas at render time and pick the new
+    // palette up on their next tick.
     function applyTheme(name) {
-        if (!THEMES[name]) return;
+        if (!THEME_NAMES.includes(name)) return;
         currentTheme = name;
         applyPalette(name);
-        // statically-styled chrome needs explicit refresh; dynamic content picks up C.* next tick.
-        panel.style.background = C.bg;
-        panel.style.color = C.text;
-        panel.style.borderColor = C.border;
-        header.style.background = C.headerBg;
-        titleSpan.style.color = C.text;
-        miniBar.style.color = C.textDim;
-        for (const m of [rootMenu, ...allSubmenus]) {
-            m.style.background = C.headerBg;
-            m.style.color = C.text;
-            m.style.borderColor = C.border;
-        }
-        const ss = document.getElementById("aimdo-viz-style");
-        if (ss) {
-            ss.textContent = `
-                #aimdo-models { scrollbar-width: thin; scrollbar-color: ${C.btn} transparent; }
-                #aimdo-models::-webkit-scrollbar { width: 8px; }
-                #aimdo-models::-webkit-scrollbar-track { background: transparent; }
-                #aimdo-models::-webkit-scrollbar-thumb { background: ${C.btn}; border-radius: 4px; }
-                #aimdo-models::-webkit-scrollbar-thumb:hover { background: ${C.textDim}; }
-            `;
-        }
-        for (const b of [unloadBtn]) {
-            b.style.background = C.btn;
-            b.style.color = C.btnText;
-        }
-        toggleBtn.style.color = C.btnText;
-        for (const b of panel.querySelectorAll(".aimdo-unload-btn, .aimdo-reset-wm-btn")) {
-            b.style.background = C.btn;
-            b.style.color = C.btnText;
-        }
-        for (const ch of rootMenu.querySelectorAll(".aimdo-chevron")) {
-            ch.style.color = C.textDim;
-        }
-        const corner = panel.querySelector(".aimdo-corner-handle");
-        if (corner) corner.style.background = cornerGripBg();
-        for (const cls of [".mini-ram-bar", ".mini-vram-bar", ".mini-cpu-bar", ".mini-gpu-bar"]) {
-            const el = miniBar.querySelector(cls);
-            if (el) el.style.background = C.barBg;
-        }
-        if (refs && refs.graphCanvas) refs.graphCanvas.style.background = C.graphBg;
-        // bottomLegend bakes colors into innerHTML — force a rebuild on next tick.
         if (refs && refs.bottomLegend) {
             refs.bottomLegend.remove();
             refs.bottomLegend = null;
@@ -1572,14 +1505,12 @@ function createPanel() {
         for (const [name, item] of themeItems) {
             const on = name === currentTheme;
             const label = name[0].toUpperCase() + name.slice(1);
-            item.innerHTML = `<span style="${CHECK_SLOT}">${on ? "✓" : ""}</span>${label}`;
+            item.innerHTML = `<span class="aimdo-check">${on ? "✓" : ""}</span>${label}`;
         }
     }
-    for (const name of Object.keys(THEMES)) {
+    for (const name of THEME_NAMES) {
         const item = document.createElement("div");
-        item.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-        item.addEventListener("mouseenter", () => item.style.background = C.btn);
-        item.addEventListener("mouseleave", () => item.style.background = "");
+        item.className = "aimdo-menu-item";
         item.addEventListener("click", (e) => {
             e.stopPropagation();
             applyTheme(name);
@@ -1598,7 +1529,7 @@ function createPanel() {
     dockWidthSliderRow.style.cssText = `padding:6px 10px;display:flex;flex-direction:column;gap:4px;min-width:180px;`;
     dockWidthSliderRow.addEventListener("click", (e) => e.stopPropagation());
     const dockWidthLabel = document.createElement("div");
-    dockWidthLabel.style.cssText = `display:flex;justify-content:space-between;font-size:10px;color:${C.textDim};`;
+    dockWidthLabel.style.cssText = `display:flex;justify-content:space-between;font-size:10px;color:var(--aimdo-textDim);`;
     dockWidthLabel.innerHTML = `<span>Section width</span><span class="aimdo-dw-val">${dockSectionWidth}px</span>`;
     const dockWidthSlider = document.createElement("input");
     dockWidthSlider.type = "range";
@@ -1606,7 +1537,7 @@ function createPanel() {
     dockWidthSlider.max = "400";
     dockWidthSlider.step = "5";
     dockWidthSlider.value = String(dockSectionWidth);
-    dockWidthSlider.style.cssText = `width:100%;accent-color:${C.vram};cursor:pointer;`;
+    dockWidthSlider.style.cssText = `width:100%;accent-color:var(--aimdo-vram);cursor:pointer;`;
     const dockWidthValSpan = dockWidthLabel.querySelector(".aimdo-dw-val");
     dockWidthSlider.addEventListener("input", () => {
         dockSectionWidth = parseInt(dockWidthSlider.value, 10);
@@ -1633,13 +1564,11 @@ function createPanel() {
     // dock / undock toggle — present only when the actionbar is available so we don't
     // offer a no-op when ComfyUI's new menu is disabled.
     const dockItem = document.createElement("div");
-    dockItem.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-    dockItem.addEventListener("mouseenter", () => dockItem.style.background = C.btn);
-    dockItem.addEventListener("mouseleave", () => dockItem.style.background = "");
+    dockItem.className = "aimdo-menu-item";
     function renderDockItem() {
         const canDock = !!getActionbarContainer();
         dockItem.style.display = (isDocked || canDock) ? "" : "none";
-        dockItem.innerHTML = `<span style="${CHECK_SLOT}">${isDocked ? "✓" : ""}</span>${isDocked ? "Undock to floating" : "Dock to top"}`;
+        dockItem.innerHTML = `<span class="aimdo-check">${isDocked ? "✓" : ""}</span>${isDocked ? "Undock to floating" : "Dock to top"}`;
     }
     dockItem.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -1653,11 +1582,9 @@ function createPanel() {
 
     // reset peak VRAM marker + clear history graph; this used to live on the header
     const resetItem = document.createElement("div");
-    resetItem.style.cssText = `padding:4px 10px;cursor:pointer;white-space:nowrap;`;
-    resetItem.innerHTML = `<span style="${CHECK_SLOT}"></span>Reset history`;
+    resetItem.className = "aimdo-menu-item";
+    resetItem.innerHTML = `<span class="aimdo-check"></span>Reset history`;
     resetItem.title = "Reset peak VRAM marker and clear history graph";
-    resetItem.addEventListener("mouseenter", () => resetItem.style.background = C.btn);
-    resetItem.addEventListener("mouseleave", () => resetItem.style.background = "");
     resetItem.addEventListener("click", (e) => {
         e.stopPropagation();
         resetHistory();
@@ -1821,14 +1748,14 @@ function ensureStructure(body) {
     body.appendChild(contentDiv);
 
     const graphHeader = document.createElement("div");
-    graphHeader.style.cssText = `display:flex;justify-content:space-between;font-size:9px;color:${C.textDim};margin-bottom:2px;flex-shrink:0;`;
+    graphHeader.style.cssText = `display:flex;justify-content:space-between;font-size:9px;color:var(--aimdo-textDim);margin-bottom:2px;flex-shrink:0;`;
     graphHeader.innerHTML = `<span class="graph-time-left"></span><span class="graph-hover-info"></span><span class="graph-time-right"></span>`;
     body.appendChild(graphHeader);
 
     const graphCanvas = document.createElement("canvas");
     graphCanvas.width = 300;
     graphCanvas.height = graphHeight;
-    graphCanvas.style.cssText = `width:100%;height:${graphHeight}px;border-radius:3px;background:${C.graphBg};flex-shrink:0;cursor:crosshair;`;
+    graphCanvas.style.cssText = `width:100%;height:${graphHeight}px;border-radius:3px;background:var(--aimdo-graphBg);flex-shrink:0;cursor:crosshair;`;
     body.appendChild(graphCanvas);
 
     // redraw without waiting for the next poll — used by the scrub-drag handler.
@@ -1903,16 +1830,15 @@ function ensureStructure(body) {
 
     // drag handle below the graph — adjusts canvas height; modelsDiv takes the rest.
     const graphResize = document.createElement("div");
-    graphResize.style.cssText = `height:4px;cursor:ns-resize;flex-shrink:0;margin:1px 0;`;
+    graphResize.className = "aimdo-graph-resize";
     graphResize.title = "Drag to resize graph";
     let graphDrag = null;
-    graphResize.addEventListener("mouseenter", () => graphResize.style.background = C.btn);
-    graphResize.addEventListener("mouseleave", () => { if (!graphDrag) graphResize.style.background = ""; });
     graphResize.addEventListener("mousedown", (e) => {
         if (e.button !== 0) return;
         e.preventDefault();
         e.stopPropagation();
         graphDrag = { startY: e.clientY, startHeight: graphCanvas.getBoundingClientRect().height };
+        graphResize.classList.add("is-dragging");
     });
     document.addEventListener("mousemove", (e) => {
         if (!graphDrag) return;
@@ -1925,7 +1851,7 @@ function ensureStructure(body) {
     document.addEventListener("mouseup", () => {
         if (graphDrag) {
             graphDrag = null;
-            graphResize.style.background = "";
+            graphResize.classList.remove("is-dragging");
             saveState({ graphHeight });
         }
     });
@@ -1954,7 +1880,7 @@ function ensureStructure(body) {
 
 function updateGraphTimes() {
     if (!refs || !refs.graphHeader) return;
-    refs.graphHeader.style.color = C.textDim;
+    refs.graphHeader.style.color = "var(--aimdo-textDim)";
     const leftEl = refs.graphHeader.querySelector(".graph-time-left");
     const hoverEl = refs.graphHeader.querySelector(".graph-hover-info");
     const rightEl = refs.graphHeader.querySelector(".graph-time-right");
@@ -1999,26 +1925,22 @@ function applyRowCollapsed(row) {
 // build (or reuse) a model row, mutating only what changed
 function renderModelRow(r, m, data) {
     const wantsWm = m.dynamic && data.aimdo_active;
-    const btnStyle = `cursor:pointer;font-size:9px;padding:0px 4px;background:${C.btn};border-radius:2px;color:${C.btnText};`;
     let row = r.modelRows[m.index];
     if (!row) {
         const el = document.createElement("div");
-        // transparent border reserves space so the row size stays constant when the stroke toggles.
-        el.style.cssText = `margin-top:6px;background:${C.rowBg};border:1px solid transparent;border-radius:4px;padding:6px 8px;`;
+        el.className = "aimdo-model-row";
         const head = document.createElement("div");
-        head.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;";
+        head.className = "aimdo-model-head";
         const nameWrap = document.createElement("span");
-        nameWrap.style.cssText = "cursor:pointer;user-select:none;padding:1px 4px;margin:-1px -4px;border-radius:3px;transition:background 0.1s;";
+        nameWrap.className = "aimdo-model-name";
         nameWrap.title = "Click to collapse/expand";
-        nameWrap.addEventListener("mouseenter", () => { nameWrap.style.background = C.btn; });
-        nameWrap.addEventListener("mouseleave", () => { nameWrap.style.background = ""; });
         const chevron = document.createElement("span");
-        chevron.style.cssText = `color:${C.textDim};margin-right:4px;font-size:9px;`;
+        chevron.className = "aimdo-model-chevron";
         const nameSpan = document.createElement("span");
         nameWrap.appendChild(chevron);
         nameWrap.appendChild(nameSpan);
         const right = document.createElement("span");
-        right.style.cssText = "display:flex;align-items:center;gap:6px;";
+        right.className = "aimdo-model-right";
         const sizeSpan = document.createElement("span");
         right.appendChild(sizeSpan);
         const unloadBtn = document.createElement("span");
@@ -2026,16 +1948,15 @@ function renderModelRow(r, m, data) {
         unloadBtn.dataset.index = m.index;
         unloadBtn.textContent = "x";
         unloadBtn.title = "Unload this model";
-        unloadBtn.style.cssText = btnStyle;
         right.appendChild(unloadBtn);
         head.appendChild(nameWrap);
         head.appendChild(right);
         el.appendChild(head);
         const bar = document.createElement("div");
-        bar.style.cssText = `background:${C.barBg};border-radius:3px;height:10px;overflow:hidden;display:flex;`;
+        bar.className = "aimdo-model-bar";
         el.appendChild(bar);
         const legend = document.createElement("div");
-        legend.style.cssText = `display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;`;
+        legend.className = "aimdo-model-legend";
         el.appendChild(legend);
         const vbarsDiv = document.createElement("div");
         el.appendChild(vbarsDiv);
@@ -2056,9 +1977,6 @@ function renderModelRow(r, m, data) {
     const vramColor = (colorModelBars && typeColor) || C.vram;
     row.nameSpan.style.color = (colorModelName && typeColor) || C.text;
     row.el.style.borderColor = (colorModelStroke && typeColor) ? hexToRgba(typeColor, 0.4) : "transparent";
-    // re-applied each tick so theme changes propagate to existing rows.
-    row.el.style.background = C.rowBg;
-    row.bar.style.background = C.barBg;
     if (!row.collapsed) row.legend.style.display = showLegends ? "flex" : "none";
     row.sizeSpan.textContent = formatBytes(m.total_size);
 
@@ -2068,7 +1986,6 @@ function renderModelRow(r, m, data) {
         wm.dataset.index = m.index;
         wm.textContent = "wm";
         wm.title = "reset watermark";
-        wm.style.cssText = btnStyle;
         row.right.insertBefore(wm, row.unloadBtn);
         row.wmBtn = wm;
     } else if (!wantsWm && row.wmBtn) {
@@ -2106,9 +2023,9 @@ function renderModelRow(r, m, data) {
         row.barSegs[3].title = "unloaded: " + formatBytes(unloadedSize);
         row.legend.innerHTML =
             `<span><span style="color:${vramColor};">&#9632;</span> VRAM ${formatBytes(m.vbar_loaded)}</span>` +
-            (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
-            (loadedRam > 0 ? `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
-            `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded ${formatBytes(unloadedSize)}</span>`;
+            (pinnedRam > 0 ? `<span><span style="color:var(--aimdo-pinned);">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
+            (loadedRam > 0 ? `<span><span style="color:var(--aimdo-loadedRam);">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
+            `<span><span style="color:var(--aimdo-unloaded);">&#9632;</span> unloaded ${formatBytes(unloadedSize)}</span>`;
     } else {
         const inRam = Math.max(0, m.total_size - m.loaded_size);
         const pinnedRam = m.pinned_ram || 0;
@@ -2125,9 +2042,9 @@ function renderModelRow(r, m, data) {
         row.barSegs[3].title = "RAM: " + formatBytes(otherRam);
         row.legend.innerHTML =
             `<span><span style="color:${vramColor};">&#9632;</span> VRAM ${formatBytes(m.loaded_size)}</span>` +
-            (pinnedRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
-            (loadedRam > 0 ? `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
-            (otherRam > 0 ? `<span><span style="color:${C.pinned};">&#9632;</span> RAM ${formatBytes(otherRam)}</span>` : "");
+            (pinnedRam > 0 ? `<span><span style="color:var(--aimdo-pinned);">&#9632;</span> pinned ${formatBytes(pinnedRam)}</span>` : "") +
+            (loadedRam > 0 ? `<span><span style="color:var(--aimdo-loadedRam);">&#9632;</span> loaded ${formatBytes(loadedRam)}</span>` : "") +
+            (otherRam > 0 ? `<span><span style="color:var(--aimdo-pinned);">&#9632;</span> RAM ${formatBytes(otherRam)}</span>` : "");
     }
 
     // vbars: rebuild structure only when device list / count changes
@@ -2141,7 +2058,7 @@ function renderModelRow(r, m, data) {
             const vb = vbars[vi];
             if (showLabel) {
                 const lbl = document.createElement("div");
-                lbl.style.cssText = `font-size:10px;color:${C.textDim};margin-top:3px;`;
+                lbl.style.cssText = `font-size:10px;color:var(--aimdo-textDim);margin-top:3px;`;
                 lbl.textContent = vb.device;
                 row.vbarsDiv.appendChild(lbl);
             }
@@ -2149,7 +2066,7 @@ function renderModelRow(r, m, data) {
             pgrid.style.cssText = "margin-top:2px;";
             row.vbarsDiv.appendChild(pgrid);
             const stats = document.createElement("div");
-            stats.style.cssText = `color:${C.textDim};font-size:10px;margin-top:2px;`;
+            stats.style.cssText = `color:var(--aimdo-textDim);font-size:10px;margin-top:2px;`;
             row.vbarsDiv.appendChild(stats);
             row.vbarRefs.push({ vi, pgrid, stats });
         }
@@ -2160,7 +2077,7 @@ function renderModelRow(r, m, data) {
 
 function renderData(body, data) {
     if (!data.enabled) {
-        body.innerHTML = `<div style="color:${C.textDim};">not available</div>`;
+        body.innerHTML = `<div style="color:var(--aimdo-textDim);">not available</div>`;
         refs = null;
         return;
     }
@@ -2219,22 +2136,32 @@ function renderData(body, data) {
     const mb = body._miniBar;
     const _u = miniShowUnits;
     const _n = miniShowNumbers;
-    mb.querySelector(".mini-vram-usage").textContent = _n
-        ? `${formatBytes(used, _u)} / ${formatBytes(data.total_vram, _u)}`
-        : "";
+    // "%" isn't a unit — units off should still show ratios as percentages, just
+    // without GB/MB/°C/W. Quantities with a denominator (RAM/VRAM/power) become
+    // "used/total" percentages; CPU/GPU util are already percentages so the "%"
+    // stays on regardless; temp has no natural denominator so we drop the °C.
+    // leading zero on single-digit values keeps width stable, matching the CPU/GPU util format
+    const asPct = (num, total) => {
+        if (total <= 0) return "?";
+        const p = Math.round(num / total * 100);
+        return (p < 10 ? "0" : "") + p + "%";
+    };
+    mb.querySelector(".mini-vram-usage").textContent = !_n ? "" :
+        _u ? `${formatBytes(used)} / ${formatBytes(data.total_vram)}`
+           : asPct(used, data.total_vram);
     mb.querySelector(".mini-vram-bar").innerHTML =
-        `<div style="background:${C.vram};height:100%;width:${aimdoPct}%;"></div>` +
-        `<div style="background:${C.torch};height:100%;width:${torchPct}%;"></div>` +
-        `<div style="background:${C.torchCache};height:100%;width:${torchCachePct}%;"></div>` +
-        `<div style="background:${C.other};height:100%;width:${otherPct}%;"></div>`;
-    mb.querySelector(".mini-ram-usage").textContent = _n
-        ? `${formatBytes(ramUsed, _u)} / ${formatBytes(ramTotal, _u)}`
-        : "";
+        `<div style="background:var(--aimdo-vram);height:100%;width:${aimdoPct}%;"></div>` +
+        `<div style="background:var(--aimdo-torch);height:100%;width:${torchPct}%;"></div>` +
+        `<div style="background:var(--aimdo-torchCache);height:100%;width:${torchCachePct}%;"></div>` +
+        `<div style="background:var(--aimdo-other);height:100%;width:${otherPct}%;"></div>`;
+    mb.querySelector(".mini-ram-usage").textContent = !_n ? "" :
+        _u ? `${formatBytes(ramUsed)} / ${formatBytes(ramTotal)}`
+           : asPct(ramUsed, ramTotal);
     mb.querySelector(".mini-ram-bar").innerHTML =
-        `<div style="background:${C.pinned};height:100%;width:${pinnedRamPct}%;"></div>` +
-        `<div style="background:${C.loadedRam};height:100%;width:${loadedRamPct}%;"></div>` +
-        `<div style="background:${C.python};height:100%;width:${pythonOtherPct}%;"></div>` +
-        `<div style="background:${C.other};height:100%;width:${ramOtherPct}%;"></div>`;
+        `<div style="background:var(--aimdo-pinned);height:100%;width:${pinnedRamPct}%;"></div>` +
+        `<div style="background:var(--aimdo-loadedRam);height:100%;width:${loadedRamPct}%;"></div>` +
+        `<div style="background:var(--aimdo-python);height:100%;width:${pythonOtherPct}%;"></div>` +
+        `<div style="background:var(--aimdo-other);height:100%;width:${ramOtherPct}%;"></div>`;
 
     // toggleable "Type" label hides RAM / VRAM / CPU / GPU prefixes (plus any device suffix)
     mb.querySelector(".mini-ram-label").style.display = miniShowType ? "" : "none";
@@ -2248,7 +2175,7 @@ function renderData(body, data) {
         const cpuColor = gpuUtilColor(data.cpu_util);
         const cpuPct = Math.round(data.cpu_util);
         mb.querySelector(".mini-cpu-usage").innerHTML = _n
-            ? `<span style="color:${cpuColor};">${(cpuPct < 10 ? "0" : "") + cpuPct}${_u ? "%" : ""}</span>`
+            ? `<span style="color:${cpuColor};">${(cpuPct < 10 ? "0" : "") + cpuPct}%</span>`
             : "";
         const cpuFill = mb.querySelector(".mini-cpu-fill");
         cpuFill.style.background = cpuColor;
@@ -2261,28 +2188,79 @@ function renderData(body, data) {
         cpuSection.style.display = "none";
     }
     const gpuSection = mb.querySelector(".mini-gpu-section");
-    if (data.gpu_util != null && showGpuInMini) {
+    // each bar is independently toggleable; section only hides when ALL three are off
+    // (or unavailable). util is no longer special — it can be off while temp/power show.
+    const _showUtil = data.gpu_util != null && showGpuInMini;
+    const _showTemp = data.gpu_temp != null && miniShowGpuTemp;
+    const _showPower = data.gpu_power != null && data.gpu_power_limit != null && miniShowGpuPower;
+    const _activeBars = (_showUtil ? 1 : 0) + (_showTemp ? 1 : 0) + (_showPower ? 1 : 0);
+    if (_activeBars > 0) {
         gpuSection.style.display = "";
-        const gpuColor = gpuUtilColor(data.gpu_util);
-        let gpuHtml = "";
-        if (_n) {
-            const pctStr = (data.gpu_util < 10 ? "0" : "") + data.gpu_util + (_u ? "%" : "");
-            gpuHtml = `<span style="color:${gpuColor};">${pctStr}</span>`;
-            if (data.gpu_temp != null && miniShowGpuTemp) {
-                gpuHtml += ` <span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}${_u ? "&deg;C" : ""}</span>`;
-            }
-            if (data.gpu_power != null && data.gpu_power_limit != null && miniShowGpuPower) {
-                gpuHtml += ` <span style="color:${gpuPowerColor(data.gpu_power, data.gpu_power_limit)};">${formatPower(data.gpu_power, data.gpu_power_limit, _u)}</span>`;
-            }
-        }
-        mb.querySelector(".mini-gpu-usage").innerHTML = gpuHtml;
-        const gpuFill = mb.querySelector(".mini-gpu-fill");
-        gpuFill.style.background = gpuColor;
-        gpuFill.style.width = `${data.gpu_util}%`;
+        // compact 8px / 3px styling kicks in only when there's >1 bar to fit
+        const isSingleBar = _activeBars === 1;
+        gpuSection.classList.toggle("is-multibar", !isSingleBar);
+
+        // title row — "GPU" or "GPU (RTX 4090)" on the left, value on the right when
+        // only one bar is visible (then the layout matches RAM/VRAM/CPU above).
         const gpuLabel = mb.querySelector(".mini-gpu-label");
         gpuLabel.textContent = (showHwNames && data.gpu_name) ? `GPU (${shortenGpuName(data.gpu_name)})` : "GPU";
         gpuLabel.title = data.gpu_name || "";
         gpuLabel.style.display = miniShowType ? "" : "none";
+        // keep the row visible if either the label is on, or there's a single-bar value to show
+        mb.querySelector(".mini-gpu-row").style.display = (miniShowType || isSingleBar) ? "" : "none";
+
+        // util row
+        mb.querySelector(".mini-util-row").style.display = _showUtil ? "" : "none";
+        if (_showUtil) {
+            const gpuColor = gpuUtilColor(data.gpu_util);
+            const gpuFill = mb.querySelector(".mini-gpu-fill");
+            gpuFill.style.background = gpuColor;
+            gpuFill.style.width = `${data.gpu_util}%`;
+            mb.querySelector(".mini-gpu-usage").innerHTML = _n
+                ? `<span style="color:${gpuColor};">${(data.gpu_util < 10 ? "0" : "") + data.gpu_util}%</span>`
+                : "";
+        }
+
+        // temp row — 100°C is full scale; units-off uses "%" since the bar already
+        // treats 100°C as the denominator (75°C → 75% of the bar full).
+        mb.querySelector(".mini-temp-row").style.display = _showTemp ? "" : "none";
+        if (_showTemp) {
+            const tempColor = gpuTempColor(data.gpu_temp);
+            const tempFill = mb.querySelector(".mini-temp-fill");
+            tempFill.style.background = tempColor;
+            tempFill.style.width = `${Math.min(100, data.gpu_temp)}%`;
+            mb.querySelector(".mini-temp-usage").innerHTML = _n
+                ? `<span style="color:${tempColor};">${data.gpu_temp}${_u ? "&deg;C" : "%"}</span>`
+                : "";
+        }
+
+        // power row — fill is draw/limit; value is W or % depending on the Units toggle
+        mb.querySelector(".mini-power-row").style.display = _showPower ? "" : "none";
+        if (_showPower) {
+            const powerColor = gpuPowerColor(data.gpu_power, data.gpu_power_limit);
+            const powerFill = mb.querySelector(".mini-power-fill");
+            powerFill.style.background = powerColor;
+            const powerPct = data.gpu_power_limit > 0
+                ? Math.min(100, data.gpu_power / data.gpu_power_limit * 100)
+                : 0;
+            powerFill.style.width = `${powerPct}%`;
+            const powerText = _u
+                ? formatPower(data.gpu_power, data.gpu_power_limit)
+                : asPct(data.gpu_power, data.gpu_power_limit);
+            mb.querySelector(".mini-power-usage").innerHTML = _n
+                ? `<span style="color:${powerColor};">${powerText}</span>`
+                : "";
+        }
+
+        // single-bar mode: lift the visible value into the title row so the section
+        // reads like RAM/VRAM/CPU above (label + value on top, bar below).
+        let headerHtml = "";
+        if (isSingleBar) {
+            if (_showUtil) headerHtml = mb.querySelector(".mini-gpu-usage").innerHTML;
+            else if (_showTemp) headerHtml = mb.querySelector(".mini-temp-usage").innerHTML;
+            else if (_showPower) headerHtml = mb.querySelector(".mini-power-usage").innerHTML;
+        }
+        mb.querySelector(".mini-gpu-header-value").innerHTML = headerHtml;
     } else {
         gpuSection.style.display = "none";
     }
@@ -2292,17 +2270,17 @@ function renderData(body, data) {
             <span>RAM</span>
             <span>${formatBytes(ramUsed)} / ${formatBytes(ramTotal)}</span>
         </div>
-        <div style="background:${C.barBg};border-radius:3px;height:8px;overflow:hidden;display:flex;">
-            <div style="background:${C.pinned};height:100%;width:${pinnedRamPct}%;" title="pinned: ${formatBytes(pinnedRamTotal)}"></div>
-            <div style="background:${C.loadedRam};height:100%;width:${loadedRamPct}%;" title="loaded: ${formatBytes(loadedRamTotal)}"></div>
-            <div style="background:${C.python};height:100%;width:${pythonOtherPct}%;" title="python: ${formatBytes(pythonOther)}"></div>
-            <div style="background:${C.other};height:100%;width:${ramOtherPct}%;" title="other: ${formatBytes(ramOther)}"></div>
+        <div style="background:var(--aimdo-barBg);border-radius:3px;height:8px;overflow:hidden;display:flex;">
+            <div style="background:var(--aimdo-pinned);height:100%;width:${pinnedRamPct}%;" title="pinned: ${formatBytes(pinnedRamTotal)}"></div>
+            <div style="background:var(--aimdo-loadedRam);height:100%;width:${loadedRamPct}%;" title="loaded: ${formatBytes(loadedRamTotal)}"></div>
+            <div style="background:var(--aimdo-python);height:100%;width:${pythonOtherPct}%;" title="python: ${formatBytes(pythonOther)}"></div>
+            <div style="background:var(--aimdo-other);height:100%;width:${ramOtherPct}%;" title="other: ${formatBytes(ramOther)}"></div>
         </div>
-        ${showLegends ? `<div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
-            <span><span style="color:${C.pinned};">&#9632;</span> pinned ${formatBytes(pinnedRamTotal)}</span>
-            <span><span style="color:${C.loadedRam};">&#9632;</span> loaded ${formatBytes(loadedRamTotal)}</span>
-            <span><span style="color:${C.python};">&#9632;</span> python ${formatBytes(pythonOther)}</span>
-            <span><span style="color:${C.other};">&#9632;</span> other ${formatBytes(ramOther)}</span>
+        ${showLegends ? `<div style="display:flex;gap:8px;font-size:10px;color:var(--aimdo-textDim);margin-top:2px;">
+            <span><span style="color:var(--aimdo-pinned);">&#9632;</span> pinned ${formatBytes(pinnedRamTotal)}</span>
+            <span><span style="color:var(--aimdo-loadedRam);">&#9632;</span> loaded ${formatBytes(loadedRamTotal)}</span>
+            <span><span style="color:var(--aimdo-python);">&#9632;</span> python ${formatBytes(pythonOther)}</span>
+            <span><span style="color:var(--aimdo-other);">&#9632;</span> other ${formatBytes(ramOther)}</span>
         </div>` : ""}
     </div>
     <div style="margin-bottom:4px;">
@@ -2310,25 +2288,25 @@ function renderData(body, data) {
             <span title="${escHtml(data.gpu_name || "")}">VRAM${(showHwNames && data.gpu_name) ? ` (${escHtml(shortenGpuName(data.gpu_name))})` : ""}</span>
             <span>${formatBytes(used)} / ${formatBytes(data.total_vram)}</span>
         </div>
-        <div style="background:${C.barBg};border-radius:3px;height:8px;overflow:hidden;display:flex;">
-            <div style="background:${C.vram};height:100%;width:${aimdoPct}%;" title="models: ${formatBytes(aimdo)}"></div>
-            <div style="background:${C.torch};height:100%;width:${torchPct}%;" title="torch: ${formatBytes(torchActive)}"></div>
-            <div style="background:${C.torchCache};height:100%;width:${torchCachePct}%;" title="cache: ${formatBytes(torchCache)}"></div>
-            <div style="background:${C.other};height:100%;width:${otherPct}%;" title="other: ${formatBytes(otherUsed)}"></div>
+        <div style="background:var(--aimdo-barBg);border-radius:3px;height:8px;overflow:hidden;display:flex;">
+            <div style="background:var(--aimdo-vram);height:100%;width:${aimdoPct}%;" title="models: ${formatBytes(aimdo)}"></div>
+            <div style="background:var(--aimdo-torch);height:100%;width:${torchPct}%;" title="torch: ${formatBytes(torchActive)}"></div>
+            <div style="background:var(--aimdo-torchCache);height:100%;width:${torchCachePct}%;" title="cache: ${formatBytes(torchCache)}"></div>
+            <div style="background:var(--aimdo-other);height:100%;width:${otherPct}%;" title="other: ${formatBytes(otherUsed)}"></div>
         </div>
-        ${showLegends ? `<div style="display:flex;gap:8px;font-size:10px;color:${C.textDim};margin-top:2px;">
-            ${aimdo > 0 ? `<span><span style="color:${C.vram};">&#9632;</span> models ${formatBytes(aimdo)}</span>` : ""}
-            ${torchActive > 0 ? `<span><span style="color:${C.torch};">&#9632;</span> torch ${formatBytes(torchActive)}</span>` : ""}
-            ${torchCache > 0 ? `<span><span style="color:${C.torchCache};">&#9632;</span> cache ${formatBytes(torchCache)}</span>` : ""}
-            <span><span style="color:${C.other};">&#9632;</span> other ${formatBytes(otherUsed)}</span>
+        ${showLegends ? `<div style="display:flex;gap:8px;font-size:10px;color:var(--aimdo-textDim);margin-top:2px;">
+            ${aimdo > 0 ? `<span><span style="color:var(--aimdo-vram);">&#9632;</span> models ${formatBytes(aimdo)}</span>` : ""}
+            ${torchActive > 0 ? `<span><span style="color:var(--aimdo-torch);">&#9632;</span> torch ${formatBytes(torchActive)}</span>` : ""}
+            ${torchCache > 0 ? `<span><span style="color:var(--aimdo-torchCache);">&#9632;</span> cache ${formatBytes(torchCache)}</span>` : ""}
+            <span><span style="color:var(--aimdo-other);">&#9632;</span> other ${formatBytes(otherUsed)}</span>
         </div>` : ""}
-        <div style="display:flex;gap:10px;font-size:10px;color:${C.textDim};margin-top:2px;">
+        <div style="display:flex;gap:10px;font-size:10px;color:var(--aimdo-textDim);margin-top:2px;">
             <span>peak: ${formatBytes(peakVramUsed)}</span>
             <span>cache: ${formatBytes(data.torch_reserved - data.torch_active)}</span>
             ${data.gpu_util != null ? `<span class="aimdo-gpu-util" title="Click to toggle GPU line on graph" style="color:${gpuUtilColor(data.gpu_util)};cursor:pointer;opacity:${gpuLineVisible ? 1 : 0.4};">GPU ${data.gpu_util < 10 ? "0" : ""}${data.gpu_util}%</span>` : ""}
             ${data.gpu_temp != null ? `<span style="color:${gpuTempColor(data.gpu_temp)};">${data.gpu_temp}&deg;C</span>` : ""}
             ${data.gpu_power != null && data.gpu_power_limit != null ? `<span title="GPU power draw / cap" style="color:${gpuPowerColor(data.gpu_power, data.gpu_power_limit)};">${formatPower(data.gpu_power, data.gpu_power_limit)}</span>` : ""}
-            ${execState.running ? `<span style="color:${C.running};">&#9679; ${execState.node || "running"}${execState.progress ? " " + execState.progress : ""}</span>` : `<span>&#9679; idle</span>`}
+            ${execState.running ? `<span style="color:var(--aimdo-running);">&#9679; ${execState.node || "running"}${execState.progress ? " " + execState.progress : ""}</span>` : `<span>&#9679; idle</span>`}
         </div>
     </div>`;
 
@@ -2353,7 +2331,7 @@ function renderData(body, data) {
     if (data.models.length === 0 && !r.noModelsMsg) {
         r.noModelsMsg = document.createElement("div");
         r.noModelsMsg.textContent = "No models loaded";
-        r.noModelsMsg.style.cssText = `color:${C.textDim};margin-top:6px;`;
+        r.noModelsMsg.style.cssText = `color:var(--aimdo-textDim);margin-top:6px;`;
         r.modelsDiv.insertBefore(r.noModelsMsg, r.modelsDiv.firstChild);
     } else if (data.models.length > 0 && r.noModelsMsg) {
         r.noModelsMsg.remove();
@@ -2379,15 +2357,15 @@ function renderData(body, data) {
 
     if (!r.bottomLegend) {
         r.bottomLegend = document.createElement("div");
-        r.bottomLegend.style.cssText = `display:flex;flex-wrap:wrap;gap:8px;font-size:10px;color:${C.textDim};margin-top:4px;border-bottom:1px solid ${C.border};padding-bottom:4px;`;
+        r.bottomLegend.style.cssText = `display:flex;flex-wrap:wrap;gap:8px;font-size:10px;color:var(--aimdo-textDim);margin-top:4px;border-bottom:1px solid var(--aimdo-border);padding-bottom:4px;`;
         r.bottomLegend.innerHTML =
-            `<span><span style="color:${C.vram};">&#9632;</span> VRAM</span>` +
-            `<span><span style="color:${C.pinned};">&#9632;</span> pinned</span>` +
-            `<span><span style="color:${C.loadedRam};">&#9632;</span> loaded</span>` +
-            `<span><span style="color:${C.unloaded};">&#9632;</span> unloaded</span>` +
-            `<span><span style="color:${C.torch};">&#9632;</span> torch</span>` +
-            `<span><span style="color:${C.totalLine};">&#9472;</span> total</span>` +
-            `<span><span style="color:${C.gpuUtil};">&#9472;</span> GPU %</span>`;
+            `<span><span style="color:var(--aimdo-vram);">&#9632;</span> VRAM</span>` +
+            `<span><span style="color:var(--aimdo-pinned);">&#9632;</span> pinned</span>` +
+            `<span><span style="color:var(--aimdo-loadedRam);">&#9632;</span> loaded</span>` +
+            `<span><span style="color:var(--aimdo-unloaded);">&#9632;</span> unloaded</span>` +
+            `<span><span style="color:var(--aimdo-torch);">&#9632;</span> torch</span>` +
+            `<span><span style="color:var(--aimdo-totalLine);">&#9472;</span> total</span>` +
+            `<span><span style="color:var(--aimdo-gpuUtil);">&#9472;</span> GPU %</span>`;
         r.modelsDiv.insertBefore(r.bottomLegend, r.modelsDiv.firstChild);
     }
     r.bottomLegend.style.display = showLegends ? "flex" : "none";
@@ -2422,7 +2400,7 @@ function renderData(body, data) {
             // swatch carries the category color; text inherits readable textDim.
             ref.stats.innerHTML =
                 `<span><span style="color:${vramColor};">&#9632;</span> ${vramPages} VRAM (${formatBytes(vramPages * PAGE)})</span>` +
-                ` <span><span style="color:${C.unloaded};">&#9632;</span> ${ramPages} unloaded (${formatBytes(ramPages * PAGE)})</span>`;
+                ` <span><span style="color:var(--aimdo-unloaded);">&#9632;</span> ${ramPages} unloaded (${formatBytes(ramPages * PAGE)})</span>`;
 
             let canvas = r.pageCanvases[vkey];
             if (!canvas) {
@@ -2478,6 +2456,9 @@ function renderData(body, data) {
 app.registerExtension({
     name: "aimdo.VRAMVisualization",
     async setup() {
+        // wait for aimdo_viz.css so applyPalette can read CSS variables back into C —
+        // canvas drawing needs real hex strings, not unresolved var() references.
+        await cssLoaded;
         const body = createPanel();
 
         api.addEventListener("execution_start", () => {
