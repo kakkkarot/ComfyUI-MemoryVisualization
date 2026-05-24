@@ -126,6 +126,46 @@
     --aimdo-type-style_model: #f472b6; --aimdo-type-gligen: #a855f7; --aimdo-type-upscale_model: #3b82f6;
 }
 
+/* CUSTOM THEME: Lucifer - Black and Red */
+[data-aimdo-theme="lucifer"] {
+    --aimdo-bg: #000000;
+    --aimdo-rowBg: #050000;
+    --aimdo-headerBg: #000000;
+    --aimdo-border: #FF0000;
+    --aimdo-btn: #110000;
+    --aimdo-btnText: #FF0000;
+    --aimdo-text: #ffffff;
+    --aimdo-textDim: #880000;
+    --aimdo-running: #ffffff;
+    --aimdo-vram: #FF0000;
+    --aimdo-torch: #CC0000;
+    --aimdo-pinned: #880000;
+    --aimdo-loadedRam: #440000;
+    --aimdo-unloaded: #222222;
+    --aimdo-torchCache: #660000;
+    --aimdo-python: #FF0000;
+    --aimdo-other: #444444;
+    --aimdo-graphBg: #000000;
+    --aimdo-gridLine: #220000;
+    --aimdo-totalLine: #ffffff;
+    --aimdo-gpuUtil: #FF0000;
+    --aimdo-gpuUtilHi: #FF5555;
+    --aimdo-capLine: #FF0000;
+    --aimdo-barBg: #110000;
+    --aimdo-fadeOutFrom: 255, 0, 0;
+    --aimdo-fadeOutTo: 0, 0, 0;
+
+    /* model type colors — all red to match the Obsidian Redline aesthetic */
+    --aimdo-type-model: #FF0000;
+    --aimdo-type-vae: #FF0000;
+    --aimdo-type-clip: #FF0000;
+    --aimdo-type-clip_vision: #FF0000;
+    --aimdo-type-controlnet: #FF0000;
+    --aimdo-type-style_model: #FF0000;
+    --aimdo-type-gligen: #FF0000;
+    --aimdo-type-upscale_model: #FF0000;
+}
+
 /* ---------------- panel ---------------- */
 #aimdo-viz-panel {
     position: fixed;
@@ -495,4 +535,3 @@
     opacity: 1; transform: scale(1.04);
     border-width: 3px; box-shadow: 0 0 20px rgba(59,130,246,0.45);
 }
-
