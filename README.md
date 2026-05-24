@@ -2,9 +2,9 @@
 
 Real-time VRAM and memory monitoring panel for ComfyUI.
 
-When [aimdo](https://github.com/aimdo-ai/ComfyUI-aimdo) is enabled, also shows per-model page-level residency heatmaps and watermark controls.
+When [aimdo](https://github.com/Comfy-Org/comfy-aimdo/) is enabled, also shows per-model page-level residency heatmaps and watermark controls.
 
-https://github.com/user-attachments/assets/25177b46-7631-4d3f-97f9-4ffae7eea24c
+https://github.com/user-attachments/assets/0d212946-1309-468d-ad0f-178ea26ba257
 
 ## Installation
 
