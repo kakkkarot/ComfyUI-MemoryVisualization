@@ -21,6 +21,7 @@ let showGpuInMini = true;
 let showCpuInMini = true;
 let showHwNames = true;
 let showTitle = true;
+let showExecBtn = false;  // optional play / cancel-running button in the header
 let miniShowNumbers = true;
 let miniShowUnits = true;
 let miniShowType = true;
@@ -556,6 +557,7 @@ function createPanel() {
     if (typeof saved.showCpuInMini === "boolean") showCpuInMini = saved.showCpuInMini;
     if (typeof saved.showHwNames === "boolean") showHwNames = saved.showHwNames;
     if (typeof saved.showTitle === "boolean") showTitle = saved.showTitle;
+    if (typeof saved.showExecBtn === "boolean") showExecBtn = saved.showExecBtn;
     if (typeof saved.miniShowNumbers === "boolean") miniShowNumbers = saved.miniShowNumbers;
     if (typeof saved.miniShowUnits === "boolean") miniShowUnits = saved.miniShowUnits;
     if (typeof saved.miniShowType === "boolean") miniShowType = saved.miniShowType;
@@ -851,6 +853,12 @@ function createPanel() {
 
     const header = document.createElement("div");
     header.className = "aimdo-header";
+    // visible drag affordance matching ComfyUI's docked actionbar handle — six dots in a 2x3 grid
+    const dragHandle = document.createElement("span");
+    dragHandle.className = "aimdo-drag-handle";
+    dragHandle.title = "Drag to move (or to dock at the top)";
+    dragHandle.innerHTML = "<span></span>".repeat(6);
+    header.appendChild(dragHandle);
     const titleSpan = document.createElement("span");
     titleSpan.className = "aimdo-title";
     titleSpan.textContent = "Memory";
@@ -896,6 +904,35 @@ function createPanel() {
 
     const headerRight = document.createElement("div");
     headerRight.className = "aimdo-header-right";
+
+    // optional play / cancel-running button. Toggles based on execState.running which
+    // setup() keeps current via api event listeners; we also call updateExecBtnState
+    // directly from those listeners so the button flips the instant execution starts/ends.
+    const execBtn = document.createElement("span");
+    execBtn.className = "aimdo-exec-btn";
+    execBtn.style.display = showExecBtn ? "" : "none";
+    function updateExecBtnState() {
+        if (execState.running) {
+            execBtn.classList.add("is-running");
+            execBtn.textContent = "■";
+            execBtn.title = "Cancel running workflow";
+        } else {
+            execBtn.classList.remove("is-running");
+            execBtn.textContent = "▶";
+            execBtn.title = "Run workflow";
+        }
+    }
+    updateExecBtnState();
+    execBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+            if (execState.running) await api.interrupt(null);
+            else await app.queuePrompt(0);
+        } catch (err) {
+            console.error("aimdo-viz: exec/interrupt failed", err);
+        }
+    });
+    headerRight.appendChild(execBtn);
 
     const unloadBtn = document.createElement("span");
     unloadBtn.className = "aimdo-btn";
@@ -1109,6 +1146,9 @@ function createPanel() {
 
     header.addEventListener("mousedown", (e) => {
         if (e.button !== 0) return;
+        // when docked, only the drag handle starts a drag — the title and buttons
+        // around it must stay plain-clickable. floating mode keeps the whole header.
+        if (isDocked && !dragHandle.contains(e.target)) return;
         autoDockPending = false;  // user intent overrides the pending auto-redock
         pendingDrag = { startX: e.clientX, startY: e.clientY, dockedAtStart: isDocked };
         if (!isDocked) {
@@ -1417,11 +1457,16 @@ function createPanel() {
         () => showLegends, v => { showLegends = v; }, "showLegends");
     const showTitleItem = makeToggleItem("Show title",
         () => showTitle, v => { showTitle = v; }, "showTitle");
+    const showExecBtnItem = makeToggleItem("Execute button",
+        () => showExecBtn,
+        v => { showExecBtn = v; execBtn.style.display = v ? "" : "none"; },
+        "showExecBtn");
     displaySubmenu.appendChild(colorBars.item);
     displaySubmenu.appendChild(colorStroke.item);
     displaySubmenu.appendChild(colorName.item);
     displaySubmenu.appendChild(showLeg.item);
     displaySubmenu.appendChild(showTitleItem.item);
+    displaySubmenu.appendChild(showExecBtnItem.item);
 
     // --- Mini view submenu
     const showRam = makeToggleItem("RAM",
@@ -1597,7 +1642,7 @@ function createPanel() {
         renderScaleItems(); renderPollItems(); renderThemeItems(); renderDockWidthItems();
         colorBars.render(); colorStroke.render(); colorName.render(); showLeg.render();
         showRam.render(); showVram.render(); showCpu.render(); showGpu.render(); showNames.render();
-        showTitleItem.render();
+        showTitleItem.render(); showExecBtnItem.render();
         showType.render(); showNumbers.render(); showUnits.render();
         showGpuTemp.render(); showGpuPower.render();
         renderDockItem();
@@ -1723,6 +1768,7 @@ function createPanel() {
     body._titleSpan = titleSpan;
     body._miniBar = miniBar;
     body._panel = panel;
+    body._updateExecBtnState = updateExecBtnState;
     return body;
 }
 
@@ -2466,6 +2512,7 @@ app.registerExtension({
             execState.node = null;
             execState.progress = null;
             pushExecEvent("start");
+            body._updateExecBtnState?.();
         });
         api.addEventListener("executing", ({ detail }) => {
             const wasRunning = execState.running;
@@ -2473,6 +2520,7 @@ app.registerExtension({
             execState.node = null;
             execState.progress = null;
             if (wasRunning && !execState.running) pushExecEvent("end");
+            body._updateExecBtnState?.();
         });
         api.addEventListener("progress", ({ detail }) => {
             if (detail) {

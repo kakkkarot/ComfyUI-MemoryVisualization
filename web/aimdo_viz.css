@@ -172,6 +172,28 @@
     color: var(--aimdo-text);
     white-space: nowrap;
 }
+/* 2x3 circular-dot drag handle — matches the grip icon on ComfyUI's docked actionbar.
+   Only shown when docked; floating mode lets the entire header act as the drag surface. */
+.aimdo-drag-handle {
+    display: none;
+    grid-template-columns: 2px 2px;
+    grid-template-rows: 2px 2px 2px;
+    gap: 2px;
+    padding: 0 4px;
+    cursor: grab;
+    touch-action: none;
+    flex-shrink: 0;
+    align-content: center;
+}
+#aimdo-viz-panel.aimdo-docked .aimdo-drag-handle { display: inline-grid; }
+.aimdo-drag-handle > span {
+    width: 2px;
+    height: 2px;
+    background: var(--aimdo-textDim);
+    border-radius: 50%;
+}
+.aimdo-drag-handle:active { cursor: grabbing; }
+.aimdo-drag-handle:hover > span { background: var(--aimdo-text); }
 .aimdo-header-right {
     display: flex; align-items: center; gap: 6px;
 }
@@ -180,6 +202,7 @@
     background: transparent !important;
     border-radius: 0 !important;
     flex-shrink: 0;
+    cursor: default;
 }
 
 /* ---------------- buttons ---------------- */
@@ -197,6 +220,23 @@
     color: var(--aimdo-btnText);
     padding: 0 4px;
 }
+
+/* play / cancel-running button — same shape as other header buttons, but the icon
+   carries the state color (green play, red stop). Hover lifts the background. */
+.aimdo-exec-btn {
+    cursor: pointer;
+    user-select: none;
+    font-size: 10px;
+    line-height: 1;
+    padding: 2px 6px;
+    background: var(--aimdo-btn);
+    border-radius: 3px;
+    color: var(--aimdo-torch);
+    white-space: nowrap;
+    transition: filter 0.1s;
+}
+.aimdo-exec-btn:hover { filter: brightness(1.4); }
+.aimdo-exec-btn.is-running { color: var(--aimdo-gpuUtilHi); }
 
 /* ---------------- mini-bar ---------------- */
 .aimdo-mini-bar {
